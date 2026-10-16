@@ -83,18 +83,22 @@ if (-not (Test-Path -LiteralPath $gameExe)) {
 }
 
 # ---------- 2. 准备启动器 ----------
+# 每次都重编一份新的 launcher_stub_built.exe：这样改过 launcher.cpp 一定生效，
+# 也不会因为旧的 launcher_stub.exe 被占用 / 改不动而一直用老的。
+$stubFresh = Join-Path (Split-Path $stubPath -Parent) "launcher_stub_built.exe"
+$gpp = Get-Command g++ -ErrorAction SilentlyContinue
+if ($gpp) {
+    Info "编译启动器 launcher_stub_built.exe ..."
+    & $gpp.Source "-std=c++17" "-mwindows" "-O2" "-s" "-static" "-o" $stubFresh $stubSrc
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $stubFresh)) {
+        $stubPath = $stubFresh
+    } else {
+        Warn "启动器编译失败，继续用现有的 launcher_stub.exe。"
+    }
+}
 if (-not (Test-Path -LiteralPath $stubPath)) {
-    $gpp = Get-Command g++ -ErrorAction SilentlyContinue
-    if (-not $gpp) {
-        Bad "缺少启动器 tools\launcher_stub.exe，而且没有 g++ 可以现场编译它。"
-        exit 1
-    }
-    Info "编译启动器 launcher_stub.exe ..."
-    & $gpp.Source "-std=c++17" "-mwindows" "-O2" "-s" "-static" "-o" $stubPath $stubSrc
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $stubPath)) {
-        Bad "启动器编译失败。"
-        exit 1
-    }
+    Bad "缺少启动器，而且没能编译出来（需要 g++）。"
+    exit 1
 }
 
 # ---------- 3. 收集要打包的文件 ----------

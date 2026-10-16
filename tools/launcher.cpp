@@ -73,6 +73,40 @@ static bool fileExists(const wstring& path) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// 新版包里已经没有的文件（比如上一版自带的示例剧本）要清掉，
+// 不然它们会一直留在解包目录里，游戏列表里也一直显示。
+static bool payloadHas(const vector<wstring>& keep, const wstring& rel) {
+    for (size_t i = 0; i < keep.size(); ++i)
+        if (keep[i] == rel) return true;
+    return false;
+}
+
+static void removeStaleFiles(const wstring& dir, const wstring& relPrefix,
+                             const vector<wstring>& keep) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    vector<wstring> subdirs;
+    do {
+        const wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (name == L"_原图") continue;  // 转换前的原图是作者自己留的，别动
+            subdirs.push_back(name);
+            continue;
+        }
+        if (name == L"存档.txt" || name == L".package") continue;
+        const wstring rel = relPrefix.empty() ? name : (relPrefix + L"\\" + name);
+        if (!payloadHas(keep, rel)) DeleteFileW(joinPath(dir, name).c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    for (const wstring& sub : subdirs) {
+        const wstring full = joinPath(dir, sub);
+        removeStaleFiles(full, relPrefix.empty() ? sub : (relPrefix + L"\\" + sub), keep);
+        RemoveDirectoryW(full.c_str());  // 空了才删得掉
+    }
+}
+
 // 递归创建目录（路径里用 \ 分隔）
 static void ensureDir(const wstring& path) {
     wstring cur;
@@ -222,6 +256,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
     const unsigned int count = readU32();
     wstring gameExe;
+    vector<wstring> payloadPaths;  // 这一版包里到底有哪些文件
     int written = 0;
     bool allOk = true;
 
@@ -232,6 +267,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         vector<wchar_t> nameBuf(nameBytes / 2 + 1, L'\0');  // 拷贝一份，避免非对齐访问
         memcpy(nameBuf.data(), p, nameBytes);
         const wstring rel(nameBuf.data(), nameBytes / 2);
+        payloadPaths.push_back(rel);
         p += nameBytes;
         const unsigned long long size = readU64();
         if (!need((size_t)size)) break;
@@ -261,7 +297,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         return 1;
     }
     // 全部文件都写成功了才记"已是最新"，否则下次运行会重来一遍
-    if (!upToDate && allOk && written == (int)count) writeTextFile(marker, stampUtf8);
+    if (!upToDate && allOk && written == (int)count) {
+        // 换了新包：把上一版留下、这一版已经没有的剧本 / 图片清掉（存档和原图不动）
+        removeStaleFiles(joinPath(targetDir, L"stories"), L"stories", payloadPaths);
+        removeStaleFiles(joinPath(targetDir, L"images"), L"images", payloadPaths);
+        writeTextFile(marker, stampUtf8);
+    }
 
     // 启动游戏本体
     STARTUPINFOW si{};
