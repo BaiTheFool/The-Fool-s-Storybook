@@ -2069,7 +2069,66 @@ struct ArchiveEntry {
 };
 static vector<ArchiveEntry> g_archives;
 
-enum class Screen { Archives, Story, Flowchart };
+enum class Screen { Archives, Story, Flowchart, Settings };
+
+/* ---------- 窗口大小预设 + 设置（存在 exe 旁边的 设置.txt） ---------- */
+struct SizePreset {
+    const wchar_t* label;
+    int w, h;    // 物理像素；w = 0 表示全屏（最大化）
+    bool full;
+};
+static const SizePreset kSizePresets[] = {
+    {L"全屏（占满屏幕，默认）", 0, 0, true},
+    {L"1920 × 1080（16:9）", 1920, 1080, false},
+    {L"1600 × 900（16:9）", 1600, 900, false},
+    {L"1440 × 810（16:9）", 1440, 810, false},
+    {L"1280 × 720（16:9）", 1280, 720, false},
+    {L"1600 × 1000（16:10）", 1600, 1000, false},
+    {L"1280 × 800（16:10）", 1280, 800, false},
+    {L"1024 × 576（16:9 小窗）", 1024, 576, false},
+};
+static const int kSizeCount = (int)(sizeof(kSizePresets) / sizeof(kSizePresets[0]));
+static int g_sizeIndex = 0;   // 0 = 全屏
+static int g_speedIndex = 1;  // 打字速度：0 慢 / 1 正常 / 2 快 / 3 瞬间
+static wstring g_settingsPath;
+static Screen g_settingsFrom = Screen::Archives;
+static int g_dispDpi = 96;    // 系统本身的显示缩放
+
+static int typingCps() {  // 每秒浮现多少字
+    switch (g_speedIndex) {
+        case 0: return 45;
+        case 2: return 140;
+        case 3: return 100000;
+        default: return 80;
+    }
+}
+
+static void saveSettings() {
+    if (g_settingsPath.empty()) return;
+    wstring out = L"# 愚见者的故事书 · 设置（用记事本改也一样有效）\r\n";
+    out += L"# size：窗口大小，对应设置界面里那一列的第几个（0 = 全屏）\r\n";
+    out += L"# speed：打字速度  0 慢 / 1 正常 / 2 快 / 3 直接全显示\r\n";
+    out += L"size " + std::to_wstring(g_sizeIndex) + L"\r\n";
+    out += L"speed " + std::to_wstring(g_speedIndex) + L"\r\n";
+    writeTextFile(g_settingsPath, out, true);
+}
+
+static void loadSettings() {
+    if (g_settingsPath.empty()) return;
+    wstring text;
+    if (!readTextFile(g_settingsPath, text)) return;
+    for (const wstring& raw : splitLines(text)) {
+        const wstring line = trim(raw);
+        if (line.empty() || line[0] == L'#') continue;
+        if (startsWith(line, L"size ")) {
+            int v = 0;
+            if (parseInt(trim(line.substr(5)), v) && v >= 0 && v < kSizeCount) g_sizeIndex = v;
+        } else if (startsWith(line, L"speed ")) {
+            int v = 0;
+            if (parseInt(trim(line.substr(6)), v) && v >= 0 && v <= 3) g_speedIndex = v;
+        }
+    }
+}
 static Screen g_screen = Screen::Archives;
 
 /* ---------- 数值（运行时的值）、存档、流程图 ---------- */
@@ -2129,6 +2188,7 @@ static vector<FlowCard> g_flowCards;
 static vector<FlowCard> g_flowPlan;  // 画布坐标下的卡片
 static map<int, float> g_flowSpreadAnim;  // 卡片下标 -> 叠卡展开动画进度 0..1
 static void scanArchives();
+static void layoutSettings();
 
 /* 展开面板：把一个节点每一次进入的记录摊开在屏幕上 */
 static bool g_fanOpen = false;
@@ -2170,7 +2230,6 @@ static vector<Step> g_shownSteps;  // 面板上现在显示的是哪一段文字
 static int g_totalChars = 0;
 static bool g_typing = false;
 static ULONGLONG g_typeStart = 0;
-static const int kCharsPerSecond = 80;
 static int g_imgNo = 0;      // 当前显示的图片编号，0 = 不显示
 static bool g_imgFull = false;
 
@@ -2187,6 +2246,7 @@ enum Action {
     A_List,
     A_Flow,
     A_Back,
+    A_Settings,
     A_Quit
 };
 struct ToolBtn {
@@ -2200,6 +2260,37 @@ static vector<ToolBtn> g_tools;
 static HFONT g_fTitle = nullptr, g_fScene = nullptr, g_fBody = nullptr, g_fQuote = nullptr,
              g_fEnding = nullptr, g_fButton = nullptr, g_fBadge = nullptr, g_fSmall = nullptr,
              g_fCardTitle = nullptr;
+
+// 字号跟着界面缩放走，所以换窗口大小时要重做一遍
+static void createFonts() {
+    if (g_fTitle) DeleteObject(g_fTitle);
+    if (g_fScene) DeleteObject(g_fScene);
+    if (g_fBody) DeleteObject(g_fBody);
+    if (g_fQuote) DeleteObject(g_fQuote);
+    if (g_fEnding) DeleteObject(g_fEnding);
+    if (g_fButton) DeleteObject(g_fButton);
+    if (g_fBadge) DeleteObject(g_fBadge);
+    if (g_fSmall) DeleteObject(g_fSmall);
+    if (g_fCardTitle) DeleteObject(g_fCardTitle);
+    g_fTitle = makeFont(23, FW_BOLD);
+    g_fScene = makeFont(13, FW_BOLD);
+    g_fBody = makeFont(12, FW_NORMAL);
+    g_fQuote = makeFont(12, FW_NORMAL);
+    g_fEnding = makeFont(17, FW_BOLD);
+    g_fButton = makeFont(12, FW_NORMAL);
+    g_fBadge = makeFont(10, FW_BOLD);
+    g_fSmall = makeFont(9, FW_NORMAL);
+    g_fCardTitle = makeFont(13, FW_BOLD);
+}
+
+/* ---------- 设置页（窗口大小 / 打字速度） ---------- */
+static bool g_ddOpen = false;        // 窗口大小那个下拉展开着
+static RECT g_ddButton{};            // 下拉按钮
+static vector<RECT> g_ddItems;       // 展开后每个选项的矩形
+static RECT g_setSizeRow{};          // 「窗口大小」这一行
+static RECT g_setSpeedRow{};         // 「打字速度」这一行
+static vector<RECT> g_speedPills;    // 慢 / 正常 / 快 / 瞬间
+static const wchar_t* kSpeedNames[4] = {L"慢", L"正常", L"快", L"瞬间"};
 /* 画刷 / 画笔 */
 static HBRUSH g_brPanel = nullptr, g_brCard = nullptr, g_brBtn = nullptr, g_brBtnHot = nullptr,
                g_brBtnDown = nullptr, g_brBadge = nullptr;
@@ -2247,7 +2338,7 @@ static int g_dragFlowGrab = 0;
 
 /* 鼠标状态 */
 enum class HotKind { None, Choice, Archive, ArchiveDel, Tool, Scrollbar, FlowCard, FlowBar, Func,
-                     TextWide };
+                     TextWide, SettingBtn, SettingItem };
 static HotKind g_hotKind = HotKind::None;
 static int g_hotIndex = -1;
 static int g_downKind = -1;  // 0 按钮 / 1 档案卡 / 2 工具
@@ -2878,7 +2969,7 @@ static int contentHeight() {
 static int revealedChars() {
     if (!g_typing) return g_totalChars;
     // 文本很长时自动加快，免得等太久（最多 8 秒左右浮现完）
-    int cps = kCharsPerSecond;
+    int cps = typingCps();  // 设置页里能调
     if (g_totalChars > cps * 8) cps = g_totalChars / 8;
     const ULONGLONG ms = GetTickCount64() - g_typeStart;
     const int n = (int)(ms * cps / 1000);
@@ -3029,11 +3120,16 @@ static void layoutTools() {
     g_tools.clear();
     vector<std::pair<Action, wstring>> items;
     if (g_screen == Screen::Story) {
-        items = {{A_Flow, L"流程图 Tab"}, {A_Restart, L"重开"}, {A_List, L"档案列表"}};
+        items = {{A_Flow, L"流程图 Tab"},
+                 {A_Restart, L"重开"},
+                 {A_Settings, L"设置"},
+                 {A_List, L"档案列表"}};
     } else if (g_screen == Screen::Flowchart) {
-        items = {{A_Back, L"返回故事 Tab"}, {A_List, L"档案列表"}};
+        items = {{A_Back, L"返回故事 Tab"}, {A_Settings, L"设置"}, {A_List, L"档案列表"}};
+    } else if (g_screen == Screen::Settings) {
+        items = {{A_Back, L"返回"}};
     } else {
-        items = {{A_Quit, L"退出"}};
+        items = {{A_Settings, L"设置"}, {A_Quit, L"退出"}};
     }
     const int h = S(22), pad = S(9);
     int total = 0;
@@ -3119,10 +3215,6 @@ static int statsPanelHeight() {
     return h;
 }
 
-static int statsPanelWidth() {
-    const int avail = (int)(g_rcContent.right - g_rcContent.left);
-    return (std::min)(S(360), avail * 44 / 100);
-}
 
 /* ==================== 流程图排版 ==================== */
 
@@ -3268,21 +3360,9 @@ static void computeLayout() {
     g_funcRects.clear();
     g_rcFuncs = {};
     if (g_screen == Screen::Story) {
-        const vector<FuncButton>& funcs = currentFuncs();
-        if (!funcs.empty()) {
-            const int fh = S(32);
-            int x = margin;
-            for (const FuncButton& fb : funcs) {
-                const int w = measure(fb.label, g_fSmall) + S(26);
-                if (x + w > g_cw - margin) break;
-                g_funcRects.push_back({x, contentTop, x + w, contentTop + fh});
-                x += w + S(8);
-            }
-            if (!g_funcRects.empty()) {
-                g_rcFuncs = {margin, contentTop, g_cw - margin, contentTop + fh};
-                contentTop += fh + S(12);
-            }
-        }
+        // @按键 现在排在左侧栏里（下面统一排），这里只清一下
+        g_funcRects.clear();
+        g_rcFuncs = {};
     }
 
     if (g_screen == Screen::Story) {
@@ -3296,49 +3376,60 @@ static void computeLayout() {
         const bool showStats = !g_ar.nodes.empty() && g_node >= 0 &&
                                g_node < (int)g_ar.nodes.size() &&
                                !g_ar.nodes[g_node].disps.empty();
-        if (showStats) {
-            // 上面一排：左边数值面板（血条之类），右边小窗图片，互不遮挡
-            const bool smallImg = (g_imgNo > 0 && !g_imgFull);
-            const int areaH = (int)(g_rcContent.bottom - g_rcContent.top);
-            int rowH = statsPanelHeight();
-            if (smallImg) rowH = (std::max)(rowH, areaH * 46 / 100);
-            rowH = (std::min)(rowH, (std::max)(S(60), areaH - S(120)));
-            const int sw = (std::min)(statsPanelWidth(),
-                                      (int)(g_rcContent.right - g_rcContent.left) - S(20));
-            g_rcStats = {g_rcContent.left, g_rcContent.top, g_rcContent.left + sw,
-                         g_rcContent.top + rowH};
-            if (smallImg) {
-                const int left = (int)g_rcStats.right + S(14);
-                if ((int)g_rcContent.right - left > S(140))
-                    g_rcImage = {left, g_rcContent.top, g_rcContent.right, g_rcContent.top + rowH};
+        const vector<FuncButton>& funcs = currentFuncs();
+        const bool hasSide = showStats || !funcs.empty();
+        const int colBottom = (int)g_rcContent.bottom;
+        const int colTop = (int)g_rcContent.top;
+        int sideW = 0;
+        if (hasSide)
+            sideW = (std::min)(S(300), (int)((g_cw - margin * 2) * 26 / 100));
+
+        if (sideW > 0) {  // 左边一栏：数值 / 数组，下面是 @按键
+            const int sideTop = g_textWide ? S(12) : colTop;
+            RECT side{margin, sideTop, margin + sideW, colBottom};
+            int y = side.top;
+            if (showStats) {
+                g_rcStats = {side.left, side.top, side.right, colBottom};
+                y = side.top + statsPanelHeight() + S(14);
             }
-            const int ptop = (int)g_rcContent.top + rowH + S(14);
-            if ((int)g_rcContent.bottom - ptop >= S(90))
-                g_rcPanel = {g_rcContent.left, ptop, g_rcContent.right, g_rcContent.bottom};
-        } else if (g_imgNo > 0 && !g_imgFull) {
-            const int ch = g_rcContent.bottom - g_rcContent.top;
-            int imgH = ch * 52 / 100;
-            imgH = (std::max)(imgH, S(150));
-            imgH = (std::min)(imgH, ch - S(170));
-            if (imgH >= S(90)) {
-                g_rcImage = {g_rcContent.left, g_rcContent.top, g_rcContent.right,
-                             g_rcContent.top + imgH};
-                g_rcPanel = {g_rcContent.left, g_rcImage.bottom + S(14), g_rcContent.right,
-                             g_rcContent.bottom};
+            if (!funcs.empty()) {  // 功能键竖着排，每个占满侧栏宽度
+                const int fh = S(30), gap = S(6);
+                for (size_t fi = 0; fi < funcs.size(); ++fi) {
+                    if (y + fh > colBottom) break;
+                    g_funcRects.push_back({side.left, y, side.right, y + fh});
+                    y += fh + gap;
+                }
+                if (!g_funcRects.empty())
+                    g_rcFuncs = {side.left, g_funcRects.front().top, side.right,
+                                 g_funcRects.back().bottom};
             }
         }
-        if (g_rcPanel.bottom - g_rcPanel.top < S(90)) {  // 位置不够就只显示文字
+
+        // 右边主区：小窗图片在上（占小一点），正文在下面吃掉剩下的全部
+        const int mainLeft = margin + sideW + (sideW > 0 ? S(16) : 0);
+        RECT mainCol{mainLeft, colTop, (int)g_rcContent.right, colBottom};
+        const bool smallImg = (g_imgNo > 0 && !g_imgFull) && !g_textWide;
+        if (smallImg) {
+            const int mainH = colBottom - colTop;
+            int imgH = (std::min)(S(320), mainH * 34 / 100);
+            if (imgH >= S(90) && mainH - imgH - S(14) >= S(160)) {
+                g_rcImage = {mainCol.left, mainCol.top, mainCol.right, mainCol.top + imgH};
+                g_rcPanel = {mainCol.left, g_rcImage.bottom + S(14), mainCol.right, colBottom};
+            } else {
+                g_rcImage = {};
+                g_rcPanel = mainCol;
+            }
+        } else {
             g_rcImage = {};
-            g_rcPanel = g_rcContent;
+            g_rcPanel = mainCol;
         }
-        if (g_textWide) {  // 展开状态：正文框顶到窗顶，数值面板 / 图片 / 按键条都先收起来
+        if (g_textWide)  // 展开：正文从窗顶一路下来，但左边的数值栏照旧露着
+            g_rcPanel = {mainCol.left, S(12), mainCol.right, colBottom};
+        if (g_rcPanel.bottom - g_rcPanel.top < S(90)) {
             g_rcImage = {};
-            g_rcStats = {};
-            g_rcFuncs = {};
-            g_funcRects.clear();
-            g_rcPanel = {margin, S(12), g_cw - margin, g_rcHint.top - S(16)};
-            g_rcContent = g_rcPanel;
+            g_rcPanel = mainCol;
         }
+        g_rcContent = {margin, colTop, (int)g_rcContent.right, colBottom};
         layoutButtons();
     } else if (g_screen == Screen::Flowchart) {
         g_buttonsTop = 0;
@@ -3351,6 +3442,12 @@ static void computeLayout() {
         g_flowScrollX = (std::max)(0, (std::min)(g_flowScrollX, flowMaxScrollX()));
         g_flowScrollY = (std::max)(0, (std::min)(g_flowScrollY, flowMaxScrollY()));
         layoutFlowCards();
+    } else if (g_screen == Screen::Settings) {
+        g_buttonsTop = 0;
+        g_rcImage = {};
+        g_rcContent = {margin, contentTop, g_cw - margin, g_rcHint.top - S(16)};
+        g_rcPanel = g_rcContent;
+        layoutSettings();
     } else {
         g_buttonsTop = 0;
         g_rcImage = {};
@@ -3378,6 +3475,21 @@ static void relayout() {
         computeLayout();
         updateAutoScroll();
     }
+}
+
+// 窗口尺寸变了：按"设计稿 940 × 760"重算界面缩放（字号跟着走），排版才始终装得下
+static void applyUiScale(int cw, int ch) {
+    if (cw <= 0 || ch <= 0) return;
+    int d = g_dispDpi;
+    const int byW = (int)((double)cw * 96.0 / 940.0);
+    const int byH = (int)((double)ch * 96.0 / 760.0);
+    if (byW < d) d = byW;
+    if (byH < d) d = byH;
+    if (d < 72) d = 72;
+    if (d == g_dpi) return;
+    g_dpi = d;
+    createFonts();
+    g_flowSpreadAnim.clear();
 }
 
 static wstring statusLine() {
@@ -3484,7 +3596,10 @@ static void drawStoryText(HDC dc) {
     int y = g_rcPanel.top + storyPadTop() - g_textScroll;
     const int panelInner = storyViewportHeight();
     const int textH = contentHeight();
-    if (textH < panelInner) y += (panelInner - textH) / 2;  // 文字块垂直居中
+    // 展开时不居中：整块贴着顶部排，遇到"差一点放不下"就整体上移，别切掉半行
+    if (!g_textWide && textH < panelInner) y += (panelInner - textH) / 2;
+    const int innerBottom = g_rcPanel.bottom - padY;
+    if (y + textH > innerBottom) y = innerBottom - textH;
 
     bool hasPrev = false, blocked = false;
     LS prevStyle = LS::Body;
@@ -4286,12 +4401,157 @@ static void paintArchives(HDC dc) {
     drawFooter(dc);
 }
 
+/* ==================== 设置页 ==================== */
+
+static void applySizePreset(int idx) {
+    if (idx < 0 || idx >= kSizeCount) return;
+    g_sizeIndex = idx;
+    const SizePreset& sp = kSizePresets[idx];
+    if (sp.full) {
+        ShowWindow(g_hwnd, SW_SHOWMAXIMIZED);
+        saveSettings();
+        return;
+    }
+    RECT rc{0, 0, sp.w, sp.h};
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    AdjustWindowRectEx(&rc, style, FALSE, 0);
+    const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
+    RECT wa{0, 0, 1920, 1080};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = wa.left + ((wa.right - wa.left) - ww) / 2;
+    int y = wa.top + ((wa.bottom - wa.top) - wh) / 2;
+    if (x < wa.left) x = wa.left;
+    if (y < wa.top) y = wa.top;
+    ShowWindow(g_hwnd, SW_RESTORE);
+    SetWindowPos(g_hwnd, nullptr, x, y, ww, wh, SWP_NOZORDER);
+    saveSettings();
+}
+
+// 设置页的位置：中间一块面板，一行窗口大小（下拉）、一行打字速度（四个小按钮）
+static void layoutSettings() {
+    g_ddItems.clear();
+    g_speedPills.clear();
+    g_ddButton = {};
+    const int w = (std::min)(S(680), (int)g_cw - S(80));
+    const int h = (std::min)(S(400), (int)g_ch - S(140));
+    const int left = (g_cw - w) / 2, top = (g_ch - h) / 2;
+    g_rcPanel = {left, top, left + w, top + h};
+
+    const int rowH = S(34), padX = S(26), labelW = S(120);
+    g_setSizeRow = {left + padX, top + S(74), g_rcPanel.right - padX, top + S(74) + rowH};
+    g_ddButton = {g_setSizeRow.left + labelW, g_setSizeRow.top, g_setSizeRow.right,
+                  g_setSizeRow.top + rowH};
+
+    g_setSpeedRow = {g_setSizeRow.left, g_setSizeRow.bottom + S(26), g_setSizeRow.right,
+                     g_setSizeRow.bottom + S(26) + rowH};
+    const int gap = S(8), pillW =
+        (int)(g_setSpeedRow.right - g_setSpeedRow.left - labelW - gap * 3) / 4;
+    int x = g_setSpeedRow.left + labelW;
+    for (int i = 0; i < 4; ++i) {
+        g_speedPills.push_back({x, g_setSpeedRow.top, x + pillW, g_setSpeedRow.top + rowH});
+        x += pillW + gap;
+    }
+
+    if (g_ddOpen) {  // 展开的选项列表，盖在下面几行上面
+        const int ih = S(30);
+        int y = g_ddButton.bottom + S(4);
+        for (int i = 0; i < kSizeCount; ++i) {
+            g_ddItems.push_back({g_ddButton.left, y, g_ddButton.right, y + ih});
+            y += ih;
+        }
+    }
+}
+
+static void paintSettings(HDC dc) {
+    if (g_bgDC) BitBlt(dc, 0, 0, g_cw, g_ch, g_bgDC, 0, 0, SRCCOPY);
+    drawHeader(dc);
+    drawStatusLine(dc);
+    drawRoundedRect(dc, g_rcPanel, S(18), g_brPanel, g_penPanel);
+
+    RECT title{g_rcPanel.left + S(26), g_rcPanel.top + S(14), g_rcPanel.right - S(26),
+               g_rcPanel.top + S(54)};
+    SelectObject(dc, g_fCardTitle);
+    SetTextColor(dc, Theme::ACCENT);
+    DrawTextW(dc, L"设置", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // 窗口大小
+    RECT lab = g_setSizeRow;
+    lab.right = g_ddButton.left - S(10);
+    SelectObject(dc, g_fBody);
+    SetTextColor(dc, Theme::TEXT_DIM);
+    DrawTextW(dc, L"窗口大小", -1, &lab, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    const bool bhot = (g_hotKind == HotKind::SettingBtn && g_hotIndex == 0) || g_ddOpen;
+    drawRoundedRect(dc, g_ddButton, S(9), bhot ? g_brBtnHot : g_brBtn,
+                    bhot ? g_penBtnHot : g_penBtn);
+    RECT bl = g_ddButton;
+    bl.right -= S(30);
+    bl.left += S(14);
+    SelectObject(dc, g_fBody);
+    SetTextColor(dc, Theme::TEXT);
+    DrawTextW(dc, kSizePresets[g_sizeIndex].label, -1, &bl,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT ar = g_ddButton;
+    ar.left = ar.right - S(30);
+    SelectObject(dc, g_fSmall);
+    SetTextColor(dc, Theme::ACCENT);
+    DrawTextW(dc, g_ddOpen ? L"▲" : L"▼", -1, &ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // 打字速度
+    RECT slab = g_setSpeedRow;
+    if (!g_speedPills.empty()) slab.right = g_speedPills.front().left - S(10);
+    SelectObject(dc, g_fBody);
+    SetTextColor(dc, Theme::TEXT_DIM);
+    DrawTextW(dc, L"打字速度", -1, &slab, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    for (size_t i = 0; i < g_speedPills.size(); ++i) {
+        const bool sel = ((int)i == g_speedIndex);
+        const bool hot = (g_hotKind == HotKind::SettingBtn && g_hotIndex == (int)i + 1);
+        drawRoundedRect(dc, g_speedPills[i], S(9), (sel || hot) ? g_brBtnHot : g_brBtn,
+                        (sel || hot) ? g_penBtnHot : g_penBtn);
+        RECT r = g_speedPills[i];
+        SelectObject(dc, g_fSmall);
+        SetTextColor(dc, sel ? Theme::ACCENT : Theme::TEXT_DIM);
+        DrawTextW(dc, kSpeedNames[i], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    RECT hint{g_rcPanel.left + S(26), g_rcPanel.bottom - S(78), g_rcPanel.right - S(26),
+              g_rcPanel.bottom - S(16)};
+    SelectObject(dc, g_fSmall);
+    SetTextColor(dc, Theme::HINT);
+    DrawTextW(dc,
+              L"窗口大小随时能换（全屏会立刻占满屏幕）；打字速度写「瞬间」就是一句话直接全显示。\r\n"
+              L"选择会记在 exe 旁边的 设置.txt 里，关掉再开还是这个设置。",
+              -1, &hint, DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+    // 下拉列表
+    if (g_ddOpen && !g_ddItems.empty()) {
+        RECT box{g_ddItems.front().left - S(6), g_ddItems.front().top - S(6),
+                 g_ddItems.back().right + S(6), g_ddItems.back().bottom + S(6)};
+        blendFillRounded(dc, box, S(12), Theme::SCRIM, 240);
+        drawRoundedRectOutline(dc, box, S(12), g_penCard);
+        for (size_t i = 0; i < g_ddItems.size(); ++i) {
+            const bool sel = ((int)i == g_sizeIndex);
+            const bool hot = (g_hotKind == HotKind::SettingItem && g_hotIndex == (int)i);
+            if (hot) blendFillRounded(dc, g_ddItems[i], S(8), Theme::BTN_HOT, 235);
+            RECT r = g_ddItems[i];
+            r.left += S(12);
+            SelectObject(dc, g_fSmall);
+            SetTextColor(dc, sel ? Theme::ACCENT : Theme::TEXT);
+            DrawTextW(dc, kSizePresets[i].label, -1, &r,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+    }
+
+    drawFooter(dc);
+}
+
 static void paintAll(HDC dc) {
     SetBkMode(dc, TRANSPARENT);
     if (g_screen == Screen::Story)
         paintStory(dc);
     else if (g_screen == Screen::Flowchart)
         paintFlowchart(dc);
+    else if (g_screen == Screen::Settings)
+        paintSettings(dc);
     else
         paintArchives(dc);
 }
@@ -5064,11 +5324,23 @@ static void runAction(Action a) {
             }
             break;
         case A_Back:
-            if (g_screen == Screen::Flowchart) {
+            if (g_screen == Screen::Settings) {
+                g_ddOpen = false;
+                g_screen = (g_settingsFrom == Screen::Settings) ? Screen::Archives : g_settingsFrom;
+                relayout();
+                InvalidateRect(g_hwnd, nullptr, FALSE);
+            } else if (g_screen == Screen::Flowchart) {
                 g_screen = Screen::Story;
                 relayout();
                 InvalidateRect(g_hwnd, nullptr, FALSE);
             }
+            break;
+        case A_Settings:
+            if (g_screen != Screen::Settings) g_settingsFrom = g_screen;
+            g_screen = Screen::Settings;
+            g_ddOpen = false;
+            relayout();
+            InvalidateRect(g_hwnd, nullptr, FALSE);
             break;
         case A_Quit: DestroyWindow(g_hwnd); break;
         default: break;
@@ -5109,6 +5381,27 @@ static void updateHover(POINT p) {
             if (PtInRect(&g_funcRects[i], p)) {
                 g_hotKind = HotKind::Func;
                 g_hotIndex = (int)i;
+                return;
+            }
+    } else if (g_screen == Screen::Settings) {
+        if (g_ddOpen) {  // 下拉展开时只认那份列表
+            for (size_t i = 0; i < g_ddItems.size(); ++i)
+                if (PtInRect(&g_ddItems[i], p)) {
+                    g_hotKind = HotKind::SettingItem;
+                    g_hotIndex = (int)i;
+                    return;
+                }
+            return;
+        }
+        if (PtInRect(&g_ddButton, p)) {
+            g_hotKind = HotKind::SettingBtn;
+            g_hotIndex = 0;
+            return;
+        }
+        for (size_t i = 0; i < g_speedPills.size(); ++i)
+            if (PtInRect(&g_speedPills[i], p)) {
+                g_hotKind = HotKind::SettingBtn;
+                g_hotIndex = (int)i + 1;
                 return;
             }
     } else if (g_screen == Screen::Archives && PtInRect(&g_rcPanel, p)) {
@@ -5233,7 +5526,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_SIZE:
-            if (g_measureDC) relayout();
+            if (g_measureDC) {
+                applyUiScale(LOWORD(lp), HIWORD(lp));
+                relayout();
+            }
             return 0;
 
         case WM_ERASEBKGND:
@@ -5443,6 +5739,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (g_hotKind == HotKind::TextWide) {
                 g_downKind = 7;
                 g_downIndex = 0;
+            } else if (g_hotKind == HotKind::SettingBtn) {
+                g_downKind = 8;
+                g_downIndex = g_hotIndex;
+            } else if (g_hotKind == HotKind::SettingItem) {
+                g_downKind = 9;
+                g_downIndex = g_hotIndex;
             } else if (g_hotKind == HotKind::Archive) {
                 g_downKind = 1;
                 g_downIndex = g_hotIndex;
@@ -5488,6 +5790,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (kind == 7 && g_hotKind == HotKind::TextWide) {  // 正文框展开 / 收起
                 g_textWide = !g_textWide;
                 g_autoScroll = true;
+                relayout();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (kind == 8 && g_hotKind == HotKind::SettingBtn) {  // 设置页上的按钮
+                if (index == 0) {
+                    g_ddOpen = !g_ddOpen;
+                    relayout();
+                } else if (index >= 1 && index <= 4) {
+                    g_speedIndex = index - 1;
+                    saveSettings();
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (kind == 9 && g_hotKind == HotKind::SettingItem) {  // 选了窗口大小
+                if (index >= 0 && index < kSizeCount) applySizePreset(index);
+                g_ddOpen = false;
                 relayout();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -5547,6 +5867,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (wp == VK_ESCAPE) closeFlowFan();
                 return 0;
             }
+            if (g_screen == Screen::Settings) {  // 设置页：Esc 先收下拉，再返回
+                if (wp == VK_ESCAPE || wp == VK_TAB) {
+                    if (g_ddOpen) {
+                        g_ddOpen = false;
+                        relayout();
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    } else {
+                        runAction(A_Back);
+                    }
+                }
+                return 0;
+            }
             if (g_cardAt >= 0) {  // 画面卡：按任意键继续
                 cardInput();
                 return 0;
@@ -5568,7 +5900,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     runAction(A_Back);
                     return 0;
                 }
+                if (g_screen == Screen::Settings) {
+                    runAction(A_Back);
+                    return 0;
+                }
                 DestroyWindow(hwnd);
+                return 0;
+            }
+            if (wp == VK_F2) {  // 顺手给个设置快捷键
+                runAction(g_screen == Screen::Settings ? A_Back : A_Settings);
                 return 0;
             }
             if (g_screen == Screen::Story) {
@@ -5659,19 +5999,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 /* ==================== 入口 ==================== */
 
 static void decideClientSize(int& cw, int& ch) {
-    HDC screen = GetDC(nullptr);
-    g_dpi = GetDeviceCaps(screen, LOGPIXELSX);
-    ReleaseDC(nullptr, screen);
-    if (g_dpi < 96) g_dpi = 96;
+    g_dpi = g_dispDpi;
 
     RECT wa{0, 0, 1920, 1080};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    const int maxW = (wa.right - wa.left) - S(40);
-    const int maxH = (wa.bottom - wa.top) - S(60);
-
     cw = S(940);
     ch = S(760);
-    while ((cw > maxW || ch > maxH) && g_dpi > 72) {
+    while ((cw > (wa.right - wa.left) || ch > (wa.bottom - wa.top)) && g_dpi > 72) {
         g_dpi -= 4;
         cw = S(940);
         ch = S(760);
@@ -5696,6 +6030,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpszClassName = L"FoolStorybookWnd";
     if (!RegisterClassExW(&wc)) return 1;
 
+    // 先读设置（窗口大小 / 打字速度），再决定窗口开成多大
+    {
+        HDC screen = GetDC(nullptr);
+        g_dispDpi = GetDeviceCaps(screen, LOGPIXELSX);
+        ReleaseDC(nullptr, screen);
+        if (g_dispDpi < 96) g_dispDpi = 96;
+    }
+    g_root = exeDir();
+    g_settingsPath = joinPath(g_root, L"设置.txt");
+    loadSettings();
+
     int cw = 0, ch = 0;
     decideClientSize(cw, ch);
 
@@ -5718,6 +6063,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+    applySizePreset(g_sizeIndex);  // 按设置里的窗口大小开局（默认全屏）
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
