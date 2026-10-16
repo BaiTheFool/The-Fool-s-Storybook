@@ -2069,7 +2069,7 @@ struct ArchiveEntry {
 };
 static vector<ArchiveEntry> g_archives;
 
-enum class Screen { Archives, Story, Flowchart, Settings };
+enum class Screen { Archives, Story, Flowchart, Settings, About };
 
 /* ---------- 窗口大小预设 + 设置（存在 exe 旁边的 设置.txt） ---------- */
 struct SizePreset {
@@ -2189,6 +2189,7 @@ static vector<FlowCard> g_flowPlan;  // 画布坐标下的卡片
 static map<int, float> g_flowSpreadAnim;  // 卡片下标 -> 叠卡展开动画进度 0..1
 static void scanArchives();
 static void layoutSettings();
+static void layoutAbout();
 
 /* 展开面板：把一个节点每一次进入的记录摊开在屏幕上 */
 static bool g_fanOpen = false;
@@ -2247,6 +2248,10 @@ enum Action {
     A_Flow,
     A_Back,
     A_Settings,
+    A_About,
+    A_CopyDoc,
+    A_OpenStories,
+    A_OpenImages,
     A_Quit
 };
 struct ToolBtn {
@@ -2338,7 +2343,7 @@ static int g_dragFlowGrab = 0;
 
 /* 鼠标状态 */
 enum class HotKind { None, Choice, Archive, ArchiveDel, Tool, Scrollbar, FlowCard, FlowBar, Func,
-                     TextWide, SettingBtn, SettingItem };
+                     TextWide, SettingBtn, SettingItem, AboutBtn };
 static HotKind g_hotKind = HotKind::None;
 static int g_hotIndex = -1;
 static int g_downKind = -1;  // 0 按钮 / 1 档案卡 / 2 工具
@@ -2355,6 +2360,10 @@ static wstring expandVars(const wstring& text);  // 前置声明（数组元素�
 
 static const UINT_PTR kTimerUi = 2;  // 数值高亮之类的界面刷新
 static const UINT_PTR kTimerFlowAnim = 3;  // 流程图叠卡展开 / 收起的动画
+static const UINT_PTR kTimerMarquee = 5;   // 选项文字太长时的横向轮播
+static int g_marqueeMs = 0;                // 轮播已经走了多少毫秒
+static bool g_marqueeOn = false;           // 有没有哪条选项需要轮播
+static RECT g_rcBtnsCol{};                 // 选项按钮占的那一列（右边可能让给图片）
 
 static bool varValue(const wstring& name, int& out) {
     for (const VarVal& v : g_vars)
@@ -3098,21 +3107,36 @@ static void rebuildBackground() {
 
 static int buttonsAreaHeight(int count) {
     if (count <= 0) count = 1;
-    if (count <= 3) return S(54) * 3 + S(10) * 2;
-    const int slotH = (count <= 5) ? S(44) : S(36);
-    return count * slotH + (count - 1) * S(8);
+    const int slotH = (count <= 3) ? S(40) : (count <= 5 ? S(32) : S(27));
+    const int gap = (count <= 3) ? S(10) : S(8);
+    return count * slotH + (count - 1) * gap;
 }
 
 static void layoutButtons() {
     g_btnRect.clear();
     const int n = (int)g_uiButtons.size();
-    if (n <= 0) return;
+    g_marqueeOn = false;
+    if (n <= 0) {
+        if (g_hwnd) KillTimer(g_hwnd, kTimerMarquee);
+        return;
+    }
     const int margin = S(26);
     const int gap = (n <= 3) ? S(10) : S(8);
-    const int slotH = (n <= 3) ? S(54) : (n <= 5 ? S(44) : S(36));
+    const int slotH = (n <= 3) ? S(40) : (n <= 5 ? S(32) : S(27));
+    // 选项只占一列（图片可以在它右边），不再从头横跨到窗口右边
+    const int left = (g_rcBtnsCol.right > g_rcBtnsCol.left) ? (int)g_rcBtnsCol.left : margin;
+    const int right = (g_rcBtnsCol.right > g_rcBtnsCol.left) ? (int)g_rcBtnsCol.right
+                                                             : (int)g_cw - margin;
     for (int i = 0; i < n; ++i) {
         const int top = g_buttonsTop + i * (slotH + gap);
-        g_btnRect.push_back({margin, top, g_cw - margin, top + slotH});
+        g_btnRect.push_back({left, top, right, top + slotH});
+        const int textW = right - S(64) - (left + S(14) + S(28) + S(14));
+        if (i < (int)g_uiButtons.size() && measure(g_uiButtons[i].label, g_fButton) > textW)
+            g_marqueeOn = true;  // 装不下 → 让它横向轮播
+    }
+    if (g_hwnd) {
+        if (g_marqueeOn) SetTimer(g_hwnd, kTimerMarquee, 40, nullptr);
+        else KillTimer(g_hwnd, kTimerMarquee);
     }
 }
 
@@ -3128,8 +3152,12 @@ static void layoutTools() {
         items = {{A_Back, L"返回故事 Tab"}, {A_Settings, L"设置"}, {A_List, L"档案列表"}};
     } else if (g_screen == Screen::Settings) {
         items = {{A_Back, L"返回"}};
+    } else if (g_screen == Screen::About) {
+        items = {{A_Back, L"返回"}};
     } else {
-        items = {{A_Settings, L"设置"}, {A_Quit, L"退出"}};
+        items = {{A_About, L"关于本游戏 & 剧本添加引导"},
+                 {A_Settings, L"设置"},
+                 {A_Quit, L"退出"}};
     }
     const int h = S(22), pad = S(9);
     int total = 0;
@@ -3372,64 +3400,86 @@ static void computeLayout() {
 
         g_rcImage = {};
         g_rcStats = {};
-        g_rcPanel = g_rcContent;
+        g_rcFuncs = {};
+        g_rcBtnsCol = {};
+        g_funcRects.clear();
         const bool showStats = !g_ar.nodes.empty() && g_node >= 0 &&
                                g_node < (int)g_ar.nodes.size() &&
                                !g_ar.nodes[g_node].disps.empty();
         const vector<FuncButton>& funcs = currentFuncs();
-        const bool hasSide = showStats || !funcs.empty();
-        const int colBottom = (int)g_rcContent.bottom;
-        const int colTop = (int)g_rcContent.top;
-        int sideW = 0;
-        if (hasSide)
-            sideW = (std::min)(S(300), (int)((g_cw - margin * 2) * 26 / 100));
+        const int areaTop = (int)g_rcContent.top;
+        const int areaBottom = (int)g_rcContent.bottom;
+        const int areaH = areaBottom - areaTop;
+        const int contentW = (int)g_rcContent.right - margin;
 
-        if (sideW > 0) {  // 左边一栏：数值 / 数组，下面是 @按键
-            const int sideTop = g_textWide ? S(12) : colTop;
-            RECT side{margin, sideTop, margin + sideW, colBottom};
-            int y = side.top;
-            if (showStats) {
-                g_rcStats = {side.left, side.top, side.right, colBottom};
-                y = side.top + statsPanelHeight() + S(14);
-            }
-            if (!funcs.empty()) {  // 功能键竖着排，每个占满侧栏宽度
-                const int fh = S(30), gap = S(6);
+        /* ---- 下半区：选项靠左（变窄），右边一块放信息（数值 / 数组 / @按键）---- */
+        const int optW = (std::min)(S(460), (int)((double)contentW * 0.30));
+        const int optH = buttonsAreaHeight(n);
+        int infoH = showStats ? statsPanelHeight() : 0;
+        const int funcRowH = funcs.empty() ? 0 : S(32);
+        if (funcRowH > 0) infoH += funcRowH + S(10);
+        int lowerH = (std::max)(optH, infoH);
+        lowerH = (std::min)(lowerH, (std::max)(S(90), areaH * 42 / 100));
+        const int lowerTop = areaBottom - lowerH;
+
+        g_rcBtnsCol = {margin, lowerTop, margin + optW, lowerTop + optH};
+        g_buttonsTop = lowerTop;
+
+        const int infoLeft = margin + optW + S(20);
+        if (infoLeft + S(160) < (int)g_cw - margin) {  // 右边放得下才放
+            int y = lowerTop;
+            if (funcRowH > 0) {  // @按键 横着排一行
+                int x = infoLeft;
                 for (size_t fi = 0; fi < funcs.size(); ++fi) {
-                    if (y + fh > colBottom) break;
-                    g_funcRects.push_back({side.left, y, side.right, y + fh});
-                    y += fh + gap;
+                    const int w = measure(funcs[fi].label, g_fSmall) + S(26);
+                    if (x + w > (int)g_cw - margin) break;
+                    g_funcRects.push_back({x, y, x + w, y + funcRowH});
+                    x += w + S(8);
                 }
-                if (!g_funcRects.empty())
-                    g_rcFuncs = {side.left, g_funcRects.front().top, side.right,
-                                 g_funcRects.back().bottom};
+                if (!g_funcRects.empty()) {
+                    g_rcFuncs = {infoLeft, y, g_funcRects.back().right, y + funcRowH};
+                    y += funcRowH + S(10);
+                }
+            }
+            if (showStats) {
+                const int sw = (std::min)(S(560), (int)g_cw - margin - infoLeft);
+                const int sh = (std::min)(statsPanelHeight(), areaBottom - y);
+                g_rcStats = {infoLeft, y, infoLeft + sw, y + sh};
             }
         }
 
-        // 右边主区：小窗图片在上（占小一点），正文在下面吃掉剩下的全部
-        const int mainLeft = margin + sideW + (sideW > 0 ? S(16) : 0);
-        RECT mainCol{mainLeft, colTop, (int)g_rcContent.right, colBottom};
-        const bool smallImg = (g_imgNo > 0 && !g_imgFull) && !g_textWide;
+        /* ---- 上半区：正文在左，图片在右（按原图比例，占满能占的地方）---- */
+        const int upperTop = areaTop;
+        const int upperBottom = lowerTop - S(16);
+        const int upperH = upperBottom - upperTop;
+        const int imgColW = (std::min)(S(820), (int)((double)contentW * 0.40));
+        const bool smallImg = (g_imgNo > 0 && !g_imgFull) && !g_textWide && upperH >= S(180) &&
+                              contentW - imgColW - S(20) >= S(420);
         if (smallImg) {
-            const int mainH = colBottom - colTop;
-            int imgH = (std::min)(S(320), mainH * 34 / 100);
-            if (imgH >= S(90) && mainH - imgH - S(14) >= S(160)) {
-                g_rcImage = {mainCol.left, mainCol.top, mainCol.right, mainCol.top + imgH};
-                g_rcPanel = {mainCol.left, g_rcImage.bottom + S(14), mainCol.right, colBottom};
-            } else {
-                g_rcImage = {};
-                g_rcPanel = mainCol;
+            const int textRight = (int)g_cw - margin - imgColW - S(20);
+            g_rcPanel = {margin, upperTop, textRight, upperBottom};
+            // 画框就按图片自己的比例算，不留黑边
+            Gdiplus::Image* img = loadImage(findImagePath(currentImageFolder(), g_imgNo));
+            double ratio = 16.0 / 9.0;
+            if (img && img->GetWidth() > 0 && img->GetHeight() > 0)
+                ratio = (double)img->GetWidth() / (double)img->GetHeight();
+            const int colLeft = textRight + S(20);
+            const int colW = (int)g_cw - margin - colLeft;
+            int w = colW, h = (int)((double)colW / ratio);
+            if (h > upperH) {
+                h = upperH;
+                w = (int)((double)upperH * ratio);
             }
+            const int cx = colLeft + (colW - w) / 2;
+            g_rcImage = {cx, upperTop + (upperH - h) / 2, cx + w, upperTop + (upperH + h) / 2};
         } else {
-            g_rcImage = {};
-            g_rcPanel = mainCol;
+            g_rcPanel = {margin, upperTop, (int)g_cw - margin, upperBottom};
         }
-        if (g_textWide)  // 展开：正文从窗顶一路下来，但左边的数值栏照旧露着
-            g_rcPanel = {mainCol.left, S(12), mainCol.right, colBottom};
-        if (g_rcPanel.bottom - g_rcPanel.top < S(90)) {
+        if (g_textWide) {  // 展开：正文吃掉图片那一列，顶到窗口最上面；下半区的信息栏照旧
             g_rcImage = {};
-            g_rcPanel = mainCol;
+            g_rcPanel = {margin, S(12), (int)g_cw - margin, upperBottom};
         }
-        g_rcContent = {margin, colTop, (int)g_rcContent.right, colBottom};
+        g_rcContent = {margin, areaTop, (int)g_rcContent.right, areaBottom};
         layoutButtons();
     } else if (g_screen == Screen::Flowchart) {
         g_buttonsTop = 0;
@@ -3448,6 +3498,12 @@ static void computeLayout() {
         g_rcContent = {margin, contentTop, g_cw - margin, g_rcHint.top - S(16)};
         g_rcPanel = g_rcContent;
         layoutSettings();
+    } else if (g_screen == Screen::About) {
+        g_buttonsTop = 0;
+        g_rcImage = {};
+        g_rcContent = {margin, contentTop, g_cw - margin, g_rcHint.top - S(16)};
+        g_rcPanel = g_rcContent;
+        layoutAbout();
     } else {
         g_buttonsTop = 0;
         g_rcImage = {};
@@ -3695,7 +3751,7 @@ static void drawButtons(HDC dc, bool fullscreen) {
                             hot ? g_penBtnHot : g_penBtn);
         }
 
-        const int badgeSize = S(28);
+        const int badgeSize = (std::min)(S(28), (int)(r.bottom - r.top) - S(6));
         RECT badge{r.left + S(14), r.top + ((r.bottom - r.top) - badgeSize) / 2,
                    r.left + S(14) + badgeSize, r.top + ((r.bottom - r.top) - badgeSize) / 2 + badgeSize};
         if (fullscreen)
@@ -3711,8 +3767,36 @@ static void drawButtons(HDC dc, bool fullscreen) {
         RECT text{badge.right + S(14), r.top, r.right - S(40), r.bottom};
         SelectObject(dc, g_fButton);
         SetTextColor(dc, hot ? Theme::TEXT : RGB(214, 223, 236));
-        DrawTextW(dc, g_uiButtons[i].label.c_str(), -1, &text,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const wstring& label = g_uiButtons[i].label;
+        const int availW = (int)(text.right - text.left);
+        const int needW = measure(label, g_fButton);
+        if (needW <= availW) {
+            DrawTextW(dc, label.c_str(), -1, &text,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        } else {
+            // 装不下：来回横着走一圈（两边各停一下），保证整句都看得到
+            const int over = needW - availW;
+            const int cycle = 1600 + over * 18 + 900;  // 停 1.6s + 走完 + 停 0.9s
+            const int phase = g_marqueeMs % (cycle * 2);
+            int off = 0;
+            if (phase < 1600) off = 0;
+            else if (phase < 1600 + over * 18)
+                off = (phase - 1600) / 18;
+            else if (phase < cycle) off = over;
+            else {
+                const int p2 = phase - cycle;
+                if (p2 < 900) off = over;
+                else if (p2 < 900 + over * 18) off = over - (p2 - 900) / 18;
+                else off = 0;
+            }
+            const int saved = SaveDC(dc);
+            IntersectClipRect(dc, text.left, text.top, text.right, text.bottom);
+            RECT t2 = text;
+            t2.left -= off;
+            t2.right = t2.left + needW + S(8);
+            DrawTextW(dc, label.c_str(), -1, &t2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            RestoreDC(dc, saved);
+        }
 
         if (hot) {
             RECT arrow{r.right - S(34), r.top, r.right - S(16), r.bottom};
@@ -4403,6 +4487,339 @@ static void paintArchives(HDC dc) {
 
 /* ==================== 设置页 ==================== */
 
+/* ==================== 关于 / 剧本添加引导 ==================== */
+
+enum class DocStyle { H1, H2, H3, Body, Bullet, Code, Quote, Rule, Table };
+struct DocLine {
+    DocStyle style = DocStyle::Body;
+    wstring text;
+};
+static vector<DocLine> g_docLines;      // README 解析出来的行
+static vector<DocLine> g_docDrawn;      // 按当前宽度折好行、可以照着画的行
+static int g_docContentH = 0;           // 折行之后总高度
+static int g_docScroll = 0;
+static int g_docTop = 0, g_docBottom = 0, g_docLeft = 0, g_docRight = 0;
+static RECT g_aboutBtnCopy{}, g_aboutBtnStories{}, g_aboutBtnImages{}, g_aboutBtnBack{};
+static wstring g_docPayload;            // 点「复制全文」时进剪贴板的整段文字
+static wstring g_docTitle;
+
+static HFONT docFont(DocStyle s) {
+    switch (s) {
+        case DocStyle::H1: return g_fTitle;
+        case DocStyle::H2: return g_fCardTitle;
+        case DocStyle::H3: return g_fScene;
+        case DocStyle::Code: return g_fSmall;
+        case DocStyle::Table: return g_fSmall;
+        case DocStyle::Quote: return g_fQuote;
+        default: return g_fBody;
+    }
+}
+static int docLineH(DocStyle s) {
+    switch (s) {
+        case DocStyle::H1: return S(44);
+        case DocStyle::H2: return S(32);
+        case DocStyle::H3: return S(28);
+        case DocStyle::Code: return S(22);
+        case DocStyle::Table: return S(24);
+        case DocStyle::Quote: return S(26);
+        case DocStyle::Rule: return S(16);
+        default: return S(27);
+    }
+}
+
+// 把 README 那样的 Markdown 拆成一行行"能画"的东西（够用的子集：标题 / 列表 / 引用 / 代码块 / 表格 / 分隔线）
+static wstring stripInlineMark(const wstring& s) {  // 去掉 **加粗** 和 `代码` 的记号，留下文字
+    wstring out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const wchar_t c = s[i];
+        if (c == L'`') continue;
+        if (c == L'*' && i + 1 < s.size() && s[i + 1] == L'*') {
+            ++i;
+            continue;
+        }
+        out += c;
+    }
+    return out;
+}
+
+static void parseMarkdownDoc(const wstring& text) {
+    g_docLines.clear();
+    bool inCode = false;
+    for (const wstring& rawLine : splitLines(text)) {
+        wstring line = rawLine;
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n')) line.pop_back();
+        const wstring t = trim(line);
+        if (startsWith(t, L"```")) {  // 代码块围栏本身不显示
+            inCode = !inCode;
+            continue;
+        }
+        if (inCode) {
+            g_docLines.push_back({DocStyle::Code, line});
+            continue;
+        }
+        if (t.empty()) {
+            if (!g_docLines.empty() && !g_docLines.back().text.empty())
+                g_docLines.push_back({DocStyle::Body, L""});
+            continue;
+        }
+        if (t == L"---" || t == L"***" || t == L"___") {
+            g_docLines.push_back({DocStyle::Rule, L""});
+            continue;
+        }
+        if (startsWith(t, L"####")) {
+            g_docLines.push_back({DocStyle::H3, stripInlineMark(trim(t.substr(4)))});
+            continue;
+        }
+        if (startsWith(t, L"###")) {
+            g_docLines.push_back({DocStyle::H3, stripInlineMark(trim(t.substr(3)))});
+            continue;
+        }
+        if (startsWith(t, L"##")) {
+            g_docLines.push_back({DocStyle::H2, stripInlineMark(trim(t.substr(2)))});
+            continue;
+        }
+        if (startsWith(t, L"#")) {
+            g_docLines.push_back({DocStyle::H1, stripInlineMark(trim(t.substr(1)))});
+            continue;
+        }
+        if (startsWith(t, L">")) {
+            g_docLines.push_back({DocStyle::Quote, L"▏ " + stripInlineMark(trim(t.substr(1)))});
+            continue;
+        }
+        if (startsWith(t, L"- ") || startsWith(t, L"* ") || startsWith(t, L"+ ")) {
+            g_docLines.push_back({DocStyle::Bullet, L"・" + stripInlineMark(trim(t.substr(2)))});
+            continue;
+        }
+        if (t.front() == L'|') {  // 表格：把竖线换成分隔符，够读就行
+            vector<wstring> cells;
+            wstring cur;
+            for (size_t i = 1; i < t.size(); ++i) {
+                if (t[i] == L'|') {
+                    cells.push_back(trim(cur));
+                    cur.clear();
+                } else {
+                    cur += t[i];
+                }
+            }
+            cells.push_back(trim(cur));
+            wstring joined, raw;
+            for (size_t i = 0; i < cells.size(); ++i) {
+                if (cells[i].empty()) continue;
+                if (!joined.empty()) joined += L"　｜　";
+                joined += cells[i];
+                raw += cells[i];
+            }
+            bool dashRow = !raw.empty();
+            for (wchar_t ch : raw)
+                if (ch != L'-' && ch != L':' && ch != L' ') dashRow = false;
+            if (dashRow) continue;  // 表格的对齐分隔行不用画
+            g_docLines.push_back({DocStyle::Table, stripInlineMark(joined)});
+            continue;
+        }
+        g_docLines.push_back({DocStyle::Body, stripInlineMark(line)});
+    }
+    // 去掉多余的连续空行
+    vector<DocLine> cleaned;
+    for (size_t i = 0; i < g_docLines.size(); ++i) {
+        if (g_docLines[i].style == DocStyle::Body && g_docLines[i].text.empty() &&
+            !cleaned.empty() && cleaned.back().style == DocStyle::Body && cleaned.back().text.empty())
+            continue;
+        cleaned.push_back(g_docLines[i]);
+    }
+    g_docLines.swap(cleaned);
+}
+
+// 按面板宽度把每行折好（画的时候照着画就行，滚动条也靠它算总高）
+static void wrapDocLines(int width) {
+    g_docDrawn.clear();
+    g_docContentH = 0;
+    if (width <= S(40)) return;
+    const int indent = S(16);
+    for (const DocLine& dl : g_docLines) {
+        const int ind = (dl.style == DocStyle::Bullet || dl.style == DocStyle::Code ||
+                         dl.style == DocStyle::Quote)
+                            ? indent
+                            : 0;
+        const int avail = width - ind;
+        if (dl.style == DocStyle::Rule) {
+            g_docDrawn.push_back(dl);
+            g_docContentH += docLineH(DocStyle::Rule);
+            continue;
+        }
+        if (dl.text.empty()) {
+            g_docDrawn.push_back({DocStyle::Body, L""});
+            g_docContentH += S(14);
+            continue;
+        }
+        HFONT f = docFont(dl.style);
+        wstring cur;
+        for (size_t i = 0; i < dl.text.size(); ++i) {
+            const wstring next = cur + dl.text[i];
+            if (!cur.empty() && measure(next, f) > avail) {
+                g_docDrawn.push_back({dl.style, cur});
+                g_docContentH += docLineH(dl.style);
+                cur = wstring(1, dl.text[i]);
+            } else {
+                cur = next;
+            }
+        }
+        g_docDrawn.push_back({dl.style, cur});
+        g_docContentH += docLineH(dl.style);
+    }
+    g_docContentH += S(16);
+}
+
+static void copyTextToClipboard(const wstring& text) {
+    if (!g_hwnd || !OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* p = GlobalLock(h)) {
+            memcpy(p, text.c_str(), bytes);
+            GlobalUnlock(h);
+            SetClipboardData(CF_UNICODETEXT, h);
+        }
+    }
+    CloseClipboard();
+}
+
+static void openFolderInExplorer(const wstring& path) {
+    ensureDir(path);
+    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static void loadAboutDoc() {
+    wstring text;
+    if (!readTextFile(joinPath(g_root, L"README.md"), text) || trim(text).empty()) {
+        text = L"# 愚见者的故事书\r\n\r\n"
+               L"没找到 README.md（它应该和 exe 放在一起）。\r\n\r\n"
+               L"## 剧本怎么写\r\n"
+               L"- 剧本是 stories 文件夹里的 .txt，一个文件一个故事；\r\n"
+               L"- 图片放 images\\<档案名>，文件名用数字，剧本里写 @图片 1 小窗；\r\n"
+               L"- 改完在游戏里按 F5 重载，不用重开。\r\n";
+    }
+    g_docTitle = L"关于本游戏 & 剧本添加引导";
+    parseMarkdownDoc(text);
+    const wstring storiesDir = g_storiesDir;
+    const wstring imagesDir = g_imagesDir;
+    g_docPayload = L"下面这份是《愚见者的故事书》的完整说明（读它就能照着写剧本、加图片）。\r\n" +
+                   wstring(L"剧本目录：") + storiesDir + L"\r\n" + wstring(L"图片目录：") + imagesDir +
+                   L"\r\n\r\n---- 下面是 README 原文 ----\r\n\r\n" + text;
+    g_docScroll = 0;
+}
+
+static int docMaxScroll() {
+    return (std::max)(0, g_docContentH - (g_docBottom - g_docTop));
+}
+
+static void layoutAbout() {
+    const int margin = S(26);
+    g_rcPanel = {margin, g_rcHeader.bottom + S(12), (int)g_cw - margin, (int)g_rcHint.top - S(16)};
+    const int padX = S(28);
+    const int btnH = S(30), gap = S(8);
+    const int y = g_rcPanel.top + S(74);
+    int x = g_rcPanel.left + padX;
+    g_aboutBtnCopy = {x, y, x + measure(L"复制全文", g_fSmall) + S(30), y + btnH};
+    x = g_aboutBtnCopy.right + gap;
+    g_aboutBtnStories = {x, y, x + measure(L"打开剧本文件夹", g_fSmall) + S(30), y + btnH};
+    x = g_aboutBtnStories.right + gap;
+    g_aboutBtnImages = {x, y, x + measure(L"打开图片文件夹", g_fSmall) + S(30), y + btnH};
+    g_aboutBtnBack = {g_rcPanel.right - padX - measure(L"返回", g_fSmall) - S(30), y,
+                      g_rcPanel.right - padX, y + btnH};
+
+    g_docLeft = g_rcPanel.left + padX;
+    g_docRight = g_rcPanel.right - padX;
+    g_docTop = g_aboutBtnCopy.bottom + S(14);
+    g_docBottom = g_rcPanel.bottom - S(14);
+    wrapDocLines(g_docRight - g_docLeft);
+    g_docScroll = (std::max)(0, (std::min)(g_docScroll, docMaxScroll()));
+}
+
+static void paintAbout(HDC dc) {
+    if (g_bgDC) BitBlt(dc, 0, 0, g_cw, g_ch, g_bgDC, 0, 0, SRCCOPY);
+    drawHeader(dc);
+    drawStatusLine(dc);
+    drawRoundedRect(dc, g_rcPanel, S(18), g_brPanel, g_penPanel);
+
+    RECT title{g_rcPanel.left + S(28), g_rcPanel.top + S(14), g_rcPanel.right - S(28),
+               g_rcPanel.top + S(52)};
+    SelectObject(dc, g_fCardTitle);
+    SetTextColor(dc, Theme::ACCENT);
+    DrawTextW(dc, g_docTitle.c_str(), -1, &title,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    RECT hint{g_rcPanel.left + S(28), title.bottom, g_rcPanel.right - S(28), title.bottom + S(24)};
+    SelectObject(dc, g_fSmall);
+    SetTextColor(dc, Theme::HINT);
+    DrawTextW(dc, L"把下面这份说明整段复制给 AI（Codex / ChatGPT 都行），就能让它照着帮你写新剧本、配图片素材。",
+              -1, &hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    auto drawBtn = [&](const RECT& r, const wstring& label, bool hot) {
+        drawRoundedRect(dc, r, S(9), hot ? g_brBtnHot : g_brBtn, hot ? g_penBtnHot : g_penBtn);
+        RECT t = r;
+        SelectObject(dc, g_fSmall);
+        SetTextColor(dc, hot ? Theme::ACCENT : Theme::TEXT);
+        DrawTextW(dc, label.c_str(), -1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    };
+    drawBtn(g_aboutBtnCopy, L"复制全文", g_hotKind == HotKind::AboutBtn && g_hotIndex == 0);
+    drawBtn(g_aboutBtnStories, L"打开剧本文件夹", g_hotKind == HotKind::AboutBtn && g_hotIndex == 1);
+    drawBtn(g_aboutBtnImages, L"打开图片文件夹", g_hotKind == HotKind::AboutBtn && g_hotIndex == 2);
+    drawBtn(g_aboutBtnBack, L"返回", g_hotKind == HotKind::AboutBtn && g_hotIndex == 3);
+
+    // README 正文
+    const int saved = SaveDC(dc);
+    IntersectClipRect(dc, g_docLeft, g_docTop, g_docRight, g_docBottom);
+    int y = g_docTop - g_docScroll;
+    for (const DocLine& dl : g_docDrawn) {
+        const int h = docLineH(dl.style);
+        if (y + h >= g_docTop && y <= g_docBottom) {
+            if (dl.style == DocStyle::Rule) {
+                HPEN old = (HPEN)SelectObject(dc, g_penRule);
+                MoveToEx(dc, g_docLeft, y + h / 2, nullptr);
+                LineTo(dc, g_docRight, y + h / 2);
+                SelectObject(dc, old);
+            } else if (!dl.text.empty()) {
+                const int ind = (dl.style == DocStyle::Bullet || dl.style == DocStyle::Code ||
+                                 dl.style == DocStyle::Quote)
+                                    ? S(16)
+                                    : 0;
+                RECT r{g_docLeft + ind, y, g_docRight, y + h};
+                SelectObject(dc, docFont(dl.style));
+                switch (dl.style) {
+                    case DocStyle::H1: SetTextColor(dc, Theme::ACCENT); break;
+                    case DocStyle::H2: SetTextColor(dc, Theme::ACCENT); break;
+                    case DocStyle::H3: SetTextColor(dc, Theme::TEXT); break;
+                    case DocStyle::Code: SetTextColor(dc, Theme::QUOTE); break;
+                    case DocStyle::Quote: SetTextColor(dc, Theme::QUOTE); break;
+                    case DocStyle::Table: SetTextColor(dc, Theme::TEXT_DIM); break;
+                    case DocStyle::Bullet: SetTextColor(dc, Theme::TEXT_DIM); break;
+                    default: SetTextColor(dc, Theme::TEXT); break;
+                }
+                DrawTextW(dc, dl.text.c_str(), -1, &r, DT_LEFT | DT_TOP | DT_SINGLELINE);
+            }
+        }
+        y += h;
+        if (y > g_docBottom) break;
+    }
+    RestoreDC(dc, saved);
+
+    // 右边的滚动条
+    const int viewH = g_docBottom - g_docTop;
+    if (g_docContentH > viewH && viewH > 0) {
+        const int trackH = viewH;
+        const int thumbH = (std::max)(S(30), trackH * viewH / g_docContentH);
+        const int travel = trackH - thumbH;
+        const int top = g_docTop + (docMaxScroll() > 0 ? travel * g_docScroll / docMaxScroll() : 0);
+        RECT track{(int)g_rcPanel.right - S(12), g_docTop, (int)g_rcPanel.right - S(6), g_docBottom};
+        RECT thumb{track.left, top, track.right, top + thumbH};
+        HPEN noPen = (HPEN)GetStockObject(NULL_PEN);
+        drawRoundedRect(dc, track, S(3), g_brScrollTrack, noPen);
+        drawRoundedRect(dc, thumb, S(3), g_brScrollThumb, noPen);
+    }
+
+    drawFooter(dc);
+}
+
 static void applySizePreset(int idx) {
     if (idx < 0 || idx >= kSizeCount) return;
     g_sizeIndex = idx;
@@ -4552,6 +4969,8 @@ static void paintAll(HDC dc) {
         paintFlowchart(dc);
     else if (g_screen == Screen::Settings)
         paintSettings(dc);
+    else if (g_screen == Screen::About)
+        paintAbout(dc);
     else
         paintArchives(dc);
 }
@@ -5324,7 +5743,12 @@ static void runAction(Action a) {
             }
             break;
         case A_Back:
-            if (g_screen == Screen::Settings) {
+            if (g_screen == Screen::About) {
+                g_screen = Screen::Archives;
+                g_docScroll = 0;
+                relayout();
+                InvalidateRect(g_hwnd, nullptr, FALSE);
+            } else if (g_screen == Screen::Settings) {
                 g_ddOpen = false;
                 g_screen = (g_settingsFrom == Screen::Settings) ? Screen::Archives : g_settingsFrom;
                 relayout();
@@ -5341,6 +5765,23 @@ static void runAction(Action a) {
             g_ddOpen = false;
             relayout();
             InvalidateRect(g_hwnd, nullptr, FALSE);
+            break;
+        case A_About:
+            loadAboutDoc();
+            g_screen = Screen::About;
+            relayout();
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            break;
+        case A_CopyDoc:
+            copyTextToClipboard(g_docPayload);
+            g_status = L"整份说明已复制到剪贴板：粘给 AI（Codex / ChatGPT）就能让它照着帮你写剧本、配图";
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            break;
+        case A_OpenStories:
+            openFolderInExplorer(g_storiesDir);
+            break;
+        case A_OpenImages:
+            openFolderInExplorer(g_imagesDir);
             break;
         case A_Quit: DestroyWindow(g_hwnd); break;
         default: break;
@@ -5402,6 +5843,14 @@ static void updateHover(POINT p) {
             if (PtInRect(&g_speedPills[i], p)) {
                 g_hotKind = HotKind::SettingBtn;
                 g_hotIndex = (int)i + 1;
+                return;
+            }
+    } else if (g_screen == Screen::About) {
+        const RECT btns[4] = {g_aboutBtnCopy, g_aboutBtnStories, g_aboutBtnImages, g_aboutBtnBack};
+        for (int i = 0; i < 4; ++i)
+            if (PtInRect(&btns[i], p)) {
+                g_hotKind = HotKind::AboutBtn;
+                g_hotIndex = i;
                 return;
             }
     } else if (g_screen == Screen::Archives && PtInRect(&g_rcPanel, p)) {
@@ -5609,6 +6058,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (!busy) KillTimer(hwnd, kTimerFlowAnim);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
+            if (wp == kTimerMarquee) {  // 选项文字横向轮播
+                if (!g_marqueeOn) {
+                    KillTimer(hwnd, kTimerMarquee);
+                } else {
+                    g_marqueeMs += 40;
+                    if (g_marqueeMs > 100000000) g_marqueeMs = 0;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            }
             return 0;
 
         case WM_MOUSEMOVE: {
@@ -5745,6 +6203,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (g_hotKind == HotKind::SettingItem) {
                 g_downKind = 9;
                 g_downIndex = g_hotIndex;
+            } else if (g_hotKind == HotKind::AboutBtn) {
+                g_downKind = 10;
+                g_downIndex = g_hotIndex;
             } else if (g_hotKind == HotKind::Archive) {
                 g_downKind = 1;
                 g_downIndex = g_hotIndex;
@@ -5812,6 +6273,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (kind == 10 && g_hotKind == HotKind::AboutBtn) {  // 引导页上的按钮
+                switch (index) {
+                    case 0: runAction(A_CopyDoc); break;
+                    case 1: runAction(A_OpenStories); break;
+                    case 2: runAction(A_OpenImages); break;
+                    case 3: runAction(A_Back); break;
+                    default: break;
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (kind == 0 && g_hotKind == HotKind::Choice && g_hotIndex == index) {
                 activateButton(index);
             } else if (kind == 1 && g_hotKind == HotKind::Archive && g_hotIndex == index) {
@@ -5837,6 +6309,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEWHEEL: {
             const int delta = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
             if (g_fanOpen) return 0;  // 展开面板开着时不滚流程图
+            if (g_screen == Screen::About) {  // 引导页里滚 README
+                g_docScroll = (std::max)(0, (std::min)(g_docScroll - delta * S(30) * 3,
+                                                       docMaxScroll()));
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g_infoOpen) {  // 信息窗里滚轮翻页
                 g_infoScroll = (std::max)(0, g_infoScroll - delta * S(26) * 3);
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -5876,6 +6354,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     } else {
                         runAction(A_Back);
                     }
+                }
+                return 0;
+            }
+            if (g_screen == Screen::About) {  // 引导页：Esc 返回，翻页键滚 README
+                if (wp == VK_ESCAPE || wp == VK_TAB) {
+                    runAction(A_Back);
+                } else if (wp == VK_PRIOR || wp == VK_UP) {
+                    g_docScroll = (std::max)(0, g_docScroll - (g_docBottom - g_docTop - S(30)));
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (wp == VK_NEXT || wp == VK_DOWN) {
+                    g_docScroll = (std::min)(docMaxScroll(),
+                                             g_docScroll + (g_docBottom - g_docTop - S(30)));
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (wp == VK_HOME) {
+                    g_docScroll = 0;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (wp == VK_END) {
+                    g_docScroll = docMaxScroll();
+                    InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 return 0;
             }
