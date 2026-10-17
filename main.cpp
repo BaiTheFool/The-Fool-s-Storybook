@@ -2190,6 +2190,12 @@ static map<int, float> g_flowSpreadAnim;  // 卡片下标 -> 叠卡展开动画�
 static void scanArchives();
 static void layoutSettings();
 static void layoutAbout();
+static void layoutStoryText(int revealAt);
+static void layoutAddButton();
+static void drawFolderPlusIcon(HDC dc, const RECT& rc, bool hot, bool down);
+static RECT g_addBtn;
+static RECT g_addBtnCap;
+static void paintScreen(HDC dc);
 
 /* 展开面板：把一个节点每一次进入的记录摊开在屏幕上 */
 static bool g_fanOpen = false;
@@ -2268,15 +2274,9 @@ static HFONT g_fTitle = nullptr, g_fScene = nullptr, g_fBody = nullptr, g_fQuote
 
 // 字号跟着界面缩放走，所以换窗口大小时要重做一遍
 static void createFonts() {
-    if (g_fTitle) DeleteObject(g_fTitle);
-    if (g_fScene) DeleteObject(g_fScene);
-    if (g_fBody) DeleteObject(g_fBody);
-    if (g_fQuote) DeleteObject(g_fQuote);
-    if (g_fEnding) DeleteObject(g_fEnding);
-    if (g_fButton) DeleteObject(g_fButton);
-    if (g_fBadge) DeleteObject(g_fBadge);
-    if (g_fSmall) DeleteObject(g_fSmall);
-    if (g_fCardTitle) DeleteObject(g_fCardTitle);
+    // 旧的字体故意不删：万一它此刻还被某个 DC 选着，删掉就会留下悬空句柄
+    // （别的电脑上出现过"换了窗口大小就卡死"，多半就是这里）。换一次窗口大小
+    // 最多漏掉 9 个字体句柄，可以忽略。
     g_fTitle = makeFont(23, FW_BOLD);
     g_fScene = makeFont(13, FW_BOLD);
     g_fBody = makeFont(12, FW_NORMAL);
@@ -2308,6 +2308,9 @@ static HPEN g_penPanel = nullptr, g_penCard = nullptr, g_penBtn = nullptr, g_pen
 static HWND g_hwnd = nullptr;
 static int g_cw = 0, g_ch = 0;
 static HDC g_bgDC = nullptr;
+static HDC g_paintDC = nullptr;        // 复用的离屏位图（每帧不重建）
+static HBITMAP g_paintBmp = nullptr;
+static int g_paintW = 0, g_paintH = 0;
 static HBITMAP g_bgBmp = nullptr;
 static int g_bgW = -1, g_bgH = -1;
 static RECT g_rcHeader{}, g_rcContent{}, g_rcPanel{}, g_rcImage{}, g_rcHint{};
@@ -2319,6 +2322,7 @@ static bool g_infoOpen = false;    // 信息窗开着吗
 static InfoBlock g_infoCurrent;    // 当前打开的那个信息窗（拷贝一份，避免下标失效）
 static int g_infoScroll = 0;
 static vector<wstring> g_infoLines;  // 信息窗里排好版的文字
+static vector<int> g_infoTag;        // 每行是啥：-1 段间空行 / 0 段首 / 1 段内续行
 static bool g_inFeedback = false;  // 正在看选项反馈（当成一个临时节点显示）
 static int g_feedbackNext = -1;    // 点「确认」之后去哪个节点
 static vector<Card> g_cardQueue;   // 画面卡：这次要依次放的卡
@@ -2343,7 +2347,7 @@ static int g_dragFlowGrab = 0;
 
 /* 鼠标状态 */
 enum class HotKind { None, Choice, Archive, ArchiveDel, Tool, Scrollbar, FlowCard, FlowBar, Func,
-                     TextWide, SettingBtn, SettingItem, AboutBtn };
+                     TextWide, SettingBtn, SettingItem, AboutBtn, AddStory };
 static HotKind g_hotKind = HotKind::None;
 static int g_hotIndex = -1;
 static int g_downKind = -1;  // 0 按钮 / 1 档案卡 / 2 工具
@@ -2356,14 +2360,129 @@ static wstring currentImageFolder() { return joinPath(g_imagesDir, g_ar.base); }
 
 static wstring expandVars(const wstring& text);  // 前置声明（数组元素写入时就要结算）
 
+// 数组展示用：同一个东西出现多次就合成「东西 ×N」，别把同一句刷屏好几遍
+static wstring joinArrayForDisplay(const StoryArray* a) {
+    if (!a) return wstring();
+    vector<wstring> uniq;
+    vector<int> cnt;
+    for (const ArrElem& e : a->items) {
+        const wstring t = expandVars(e.text);
+        size_t k = 0;
+        for (; k < uniq.size(); ++k)
+            if (uniq[k] == t) {
+                cnt[k]++;
+                break;
+            }
+        if (k == uniq.size()) {
+            uniq.push_back(t);
+            cnt.push_back(1);
+        }
+    }
+    wstring out;
+    for (size_t k = 0; k < uniq.size(); ++k) {
+        if (k) out += L"、";
+        out += uniq[k];
+        if (cnt[k] > 1) out += L" ×" + std::to_wstring(cnt[k]);
+    }
+    return out;
+}
+
 /* ==================== 数值运行时 ==================== */
 
 static const UINT_PTR kTimerUi = 2;  // 数值高亮之类的界面刷新
 static const UINT_PTR kTimerFlowAnim = 3;  // 流程图叠卡展开 / 收起的动画
 static const UINT_PTR kTimerMarquee = 5;   // 选项文字太长时的横向轮播
+static const UINT_PTR kTimerSplash = 6;    // 开场渐显渐隐
+static const int kSplashIn = 1200;         // 渐显用时（黑幕 → 画面）
+static const int kSplashHold = 3200;       // 完全显示到什么时候
+static const int kSplashTotal = 5200;      // 整体结束（之后 2 秒在"淡出/露出列表"）
+static bool g_splashOn = false;
+static ULONGLONG g_splashStart = 0;
+static Gdiplus::Image* g_splashImg = nullptr;
+static bool g_splashTried = false;
+// 开场图的缓存：按窗口大小预先缩放过一次，之后每帧只做一次 AlphaBlend。
+// 不缓存的话每帧都要把 2700×1500 的图重新高质量缩放，一帧几十毫秒，看着就一顿一顿的。
+static HDC g_splashDC = nullptr;
+static HBITMAP g_splashBmp = nullptr;
+static HBITMAP g_splashOldBmp = nullptr;   // 建的时候先存下原图，删之前换回去
+static int g_splashCacheW = 0, g_splashCacheH = 0;
+
+static void freeSplashCache() {
+    if (g_splashDC && g_splashOldBmp) {  // 位图不能还选在 DC 里就删，先换回原来那张
+        SelectObject(g_splashDC, g_splashOldBmp);
+        g_splashOldBmp = nullptr;
+    }
+    if (g_splashDC) {
+        DeleteDC(g_splashDC);
+        g_splashDC = nullptr;
+    }
+    if (g_splashBmp) {
+        DeleteObject(g_splashBmp);
+        g_splashBmp = nullptr;
+    }
+    g_splashCacheW = g_splashCacheH = 0;
+}
+
+static void buildSplashCache(int w, int h) {
+    if (w <= 0 || h <= 0 || !g_splashImg) return;
+    if (g_splashDC && g_splashCacheW == w && g_splashCacheH == h) return;
+    freeSplashCache();
+    g_splashDC = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;  // 自上而下
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    g_splashBmp = CreateDIBSection(g_splashDC, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!g_splashBmp) {
+        DeleteDC(g_splashDC);
+        g_splashDC = nullptr;
+        return;
+    }
+    HGDIOBJ old = SelectObject(g_splashDC, g_splashBmp);
+    g_splashOldBmp = (HBITMAP)old;  // 删之前要先换回来
+    RECT all{0, 0, w, h};
+    HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(g_splashDC, &all, black);
+    DeleteObject(black);
+    const double iw = (double)g_splashImg->GetWidth(), ih = (double)g_splashImg->GetHeight();
+    if (iw > 0 && ih > 0) {  // 只缩这一次，可以用最高质量
+        const double scale = (std::max)((double)w / iw, (double)h / ih);
+        const double dw = iw * scale, dh = ih * scale;
+        Gdiplus::Graphics g(g_splashDC);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        g.DrawImage(g_splashImg,
+                    Gdiplus::RectF((Gdiplus::REAL)((w - dw) / 2), (Gdiplus::REAL)((h - dh) / 2),
+                                   (Gdiplus::REAL)dw, (Gdiplus::REAL)dh));
+        g.Flush(Gdiplus::FlushIntentionSync);
+    }
+    // 注意：这里**不要**把原来的位图换回去 —— DIB 必须一直留在 g_splashDC 里，
+    // 否则后面 BitBlt / AlphaBlend 拿到的是那张 1×1 单色默认位图，画面就是全黑。
+    // （freeSplashCache 里销毁之前才换回 g_splashOldBmp。）
+    // GDI+ 往 DIB 上画时不会维护 alpha 通道（留下 0），AlphaBlend 会按它乘一遍 → 全黑，
+    // 所以统一补成不透明，后面只受"整体透明度"控制。
+    if (bits) {
+        DWORD* px = (DWORD*)bits;
+        const size_t n = (size_t)w * (size_t)h;
+        for (size_t i = 0; i < n; ++i) px[i] |= 0xFF000000u;
+    }
+    g_splashCacheW = w;
+    g_splashCacheH = h;
+}
 static int g_marqueeMs = 0;                // 轮播已经走了多少毫秒
 static bool g_marqueeOn = false;           // 有没有哪条选项需要轮播
 static RECT g_rcBtnsCol{};                 // 选项按钮占的那一列（右边可能让给图片）
+static int g_btnSlotH = 0;                 // 选项按钮高度，0 = 按条数自动
+static ULONGLONG g_flowJumpAt = 0;         // 刚打开流程图时，当前节点闪一下
+// 点击冷却：一次点击处理完之后，这么长时间内不再接收任何鼠标点击/滚轮，
+// 免得手快点两下把选项连点了、或者点完立刻滚轮把页面带跑
+static const int kClickCooldownMs = 350;
+static ULONGLONG g_clickLockUntil = 0;
+static bool clickLocked() { return GetTickCount64() < g_clickLockUntil; }
 
 static bool varValue(const wstring& name, int& out) {
     for (const VarVal& v : g_vars)
@@ -2677,7 +2796,6 @@ static void loadSave() {
             if (!hasOrder) en.order = list.empty() ? 1 : (list.back().order + 1);
             list.push_back(en);
         } else if (startsWith(f[0], L"edge ") && f.size() >= 2) {
-        } else if (startsWith(f[0], L"edge ") && f.size() >= 2) {
             const wstring base = trim(f[0].substr(5));
             if (base.empty()) continue;
             StoryProgress& p = g_progress[base];
@@ -2785,13 +2903,29 @@ static void buildGraph() {
     g_graphDepth.assign(g_ar.nodes.size(), -1);
 
     for (size_t i = 0; i < g_ar.nodes.size(); ++i) {
-        for (const Choice& c : g_ar.nodes[i].choices) {
+        const Node& n = g_ar.nodes[i];
+        for (const Choice& c : n.choices) {
             const int t = nodeIndexOf(g_ar, c.target);
             if (t >= 0) g_graphEdges.push_back({(int)i, t, c.text, !c.conds.empty()});
         }
-        for (const JumpTarget& j : g_ar.nodes[i].jumps) {
+        for (const JumpTarget& j : n.jumps) {
             const int t = nodeIndexOf(g_ar, j.target);
             if (t >= 0) g_graphEdges.push_back({(int)i, t, L"", !j.conds.empty()});
+        }
+        // @按键 -> 节点 也是一条路（以前漏了，靠按键进的节点会被当成"走不到"）
+        for (const FuncButton& fb : n.funcs) {
+            const int t = nodeIndexOf(g_ar, fb.target);
+            if (t >= 0) g_graphEdges.push_back({(int)i, t, fb.label, true});
+        }
+        // @行动 / @回合 里的出口同样算路（封装节点的胜负线就是从这里出去的）
+        for (const ActionBlock& ab : n.actions)
+            for (const JumpTarget& j : ab.body.jumps) {
+                const int t = nodeIndexOf(g_ar, j.target);
+                if (t >= 0) g_graphEdges.push_back({(int)i, t, L"", true});
+            }
+        for (const JumpTarget& j : n.round.jumps) {
+            const int t = nodeIndexOf(g_ar, j.target);
+            if (t >= 0) g_graphEdges.push_back({(int)i, t, L"", true});
         }
     }
 
@@ -2807,6 +2941,18 @@ static void buildGraph() {
                 queue_.push_back(e.to);
             }
     }
+    // 还是算不出层数的（从起点确实走不到，比如只从别处绕回）：按"能到它的节点 +1"往回推
+    for (int pass = 0; pass < (int)g_ar.nodes.size() + 4; ++pass) {
+        bool changed = false;
+        for (const GraphEdge& e : g_graphEdges)
+            if (g_graphDepth[e.from] >= 0 && g_graphDepth[e.to] < 0) {
+                g_graphDepth[e.to] = g_graphDepth[e.from] + 1;
+                changed = true;
+            }
+        if (!changed) break;
+    }
+    for (int& d : g_graphDepth)
+        if (d < 0) d = 0;  // 真的一条路都没有的，才留在第一层
 }
 
 /* ==================== 折行 ==================== */
@@ -2901,10 +3047,7 @@ static wstring expandVars(const wstring& text) {
                 done = true;
             } else if (const StoryArray* a = findArray(inside)) {
                 // {背包}：把整个数组列出来
-                for (size_t k = 0; k < a->items.size(); ++k) {
-                    if (k) out += L"、";
-                    out += a->items[k].text;
-                }
+                out += joinArrayForDisplay(a);
                 done = true;
             }
         }
@@ -3122,7 +3265,8 @@ static void layoutButtons() {
     }
     const int margin = S(26);
     const int gap = (n <= 3) ? S(10) : S(8);
-    const int slotH = (n <= 3) ? S(40) : (n <= 5 ? S(32) : S(27));
+    const int autoSlot = (n <= 3) ? S(40) : (n <= 5 ? S(32) : S(27));
+    const int slotH = (g_btnSlotH > 0) ? g_btnSlotH : autoSlot;
     // 选项只占一列（图片可以在它右边），不再从头横跨到窗口右边
     const int left = (g_rcBtnsCol.right > g_rcBtnsCol.left) ? (int)g_rcBtnsCol.left : margin;
     const int right = (g_rcBtnsCol.right > g_rcBtnsCol.left) ? (int)g_rcBtnsCol.right
@@ -3155,9 +3299,7 @@ static void layoutTools() {
     } else if (g_screen == Screen::About) {
         items = {{A_Back, L"返回"}};
     } else {
-        items = {{A_About, L"关于本游戏 & 剧本添加引导"},
-                 {A_Settings, L"设置"},
-                 {A_Quit, L"退出"}};
+        items = {{A_Settings, L"设置"}, {A_Quit, L"退出"}};
     }
     const int h = S(22), pad = S(9);
     int total = 0;
@@ -3183,7 +3325,7 @@ static void layoutArchiveCards() {
     const int padX = S(22), cardH = S(66), gap = S(12);
     const int x0 = g_rcPanel.left + padX;
     const int w = (g_rcPanel.right - g_rcPanel.left) - padX * 2;
-    int y = g_rcPanel.top + S(20) - g_archiveScroll;
+    int y = g_rcPanel.top + S(96) - g_archiveScroll;  // 上面留给「剧本档案」标题和那行小字
     for (size_t i = 0; i < g_archives.size(); ++i) {
         g_archiveCards.push_back({x0, y, x0 + w, y + cardH});
         y += cardH + gap;
@@ -3192,7 +3334,7 @@ static void layoutArchiveCards() {
 
 static int archiveListContentHeight() {
     const int cardH = S(66), gap = S(12);
-    return (int)g_archives.size() * (cardH + gap) + S(20) * 2 - gap;
+    return (int)g_archives.size() * (cardH + gap) + S(96) + S(20) - gap;
 }
 
 /* ==================== 侧栏数值面板 ==================== */
@@ -3408,24 +3550,41 @@ static void computeLayout() {
                                !g_ar.nodes[g_node].disps.empty();
         const vector<FuncButton>& funcs = currentFuncs();
         const int areaTop = (int)g_rcContent.top;
-        const int areaBottom = (int)g_rcContent.bottom;
+        const int areaBottom = (int)g_rcHint.top - S(16);  // 页脚之上；别把按钮区再扣一次
         const int areaH = areaBottom - areaTop;
         const int contentW = (int)g_rcContent.right - margin;
 
         /* ---- 下半区：选项靠左（变窄），右边一块放信息（数值 / 数组 / @按键）---- */
-        const int optW = (std::min)(S(460), (int)((double)contentW * 0.30));
+        // 信息栏保持"差不多"的宽度，剩下的宽度全给选项列 —— 两块加起来正好铺满下面一条
+        const int gutter = S(20);
+        int infoW = (std::min)(S(380), (int)((double)contentW * 0.36));
+        if (infoW < S(260)) infoW = S(260);
+        int optW = contentW - infoW - gutter;
+        if (optW < S(320)) {  // 窗口太窄就把信息栏压缩一点，别把选项挤没
+            optW = S(320);
+            infoW = (std::max)(S(220), contentW - optW - gutter);
+        }
         const int optH = buttonsAreaHeight(n);
         int infoH = showStats ? statsPanelHeight() : 0;
         const int funcRowH = funcs.empty() ? 0 : S(32);
         if (funcRowH > 0) infoH += funcRowH + S(10);
         int lowerH = (std::max)(optH, infoH);
-        lowerH = (std::min)(lowerH, (std::max)(S(90), areaH * 42 / 100));
+        lowerH = (std::min)(lowerH, (std::max)(S(90), areaH * 45 / 100));
+        // 选项按钮跟着信息栏的高度走，让两者一起正好把下面这条占满
+        const int btnGap = (n <= 3) ? S(10) : S(8);
+        if (n > 0 && lowerH > optH) {
+            const int fit = (lowerH - (n - 1) * btnGap) / n;
+            g_btnSlotH = (std::min)(S(58), (std::max)(S(27), fit));
+        } else {
+            g_btnSlotH = 0;
+        }
         const int lowerTop = areaBottom - lowerH;
 
         g_rcBtnsCol = {margin, lowerTop, margin + optW, lowerTop + optH};
-        g_buttonsTop = lowerTop;
+        const int optTotal = (g_btnSlotH > 0 ? n * g_btnSlotH + (n - 1) * btnGap : optH);
+        g_buttonsTop = lowerTop + (std::max)(0, (lowerH - optTotal) / 2);  // 不够高就居中
 
-        const int infoLeft = margin + optW + S(20);
+        const int infoLeft = margin + optW + gutter;
         if (infoLeft + S(160) < (int)g_cw - margin) {  // 右边放得下才放
             int y = lowerTop;
             if (funcRowH > 0) {  // @按键 横着排一行
@@ -3442,7 +3601,7 @@ static void computeLayout() {
                 }
             }
             if (showStats) {
-                const int sw = (std::min)(S(560), (int)g_cw - margin - infoLeft);
+                const int sw = (std::min)(infoW, (int)g_cw - margin - infoLeft);  // 正好补到右边
                 const int sh = (std::min)(statsPanelHeight(), areaBottom - y);
                 g_rcStats = {infoLeft, y, infoLeft + sw, y + sh};
             }
@@ -3518,6 +3677,7 @@ static void computeLayout() {
         const int maxScroll = (std::max)(0, archiveListContentHeight() - S(20) * 2 - inner);
         g_archiveScroll = (std::max)(0, (std::min)(g_archiveScroll, maxScroll));
         layoutArchiveCards();
+        layoutAddButton();
     }
     if (g_fanOpen) layoutFlowFan();  // 展开面板跟着窗口大小重排
 }
@@ -3526,10 +3686,22 @@ static void computeLayout() {
 static void relayout() {
     computeLayout();
     if (g_screen == Screen::Story && !g_ar.nodes.empty()) {
-        buildCurrentLines();
-        applyImageMarkers(revealedChars());
-        computeLayout();
+        layoutStoryText(revealedChars());
         updateAutoScroll();
+    }
+}
+
+// 正文排版 + 折行：图片出现 / 消失会改正文框宽度，宽度一变就按新宽度重新折行，
+// 否则行是按宽框折的、画在窄框里，行尾会被切掉
+static void layoutStoryText(int revealAt) {
+    computeLayout();          // 先拿到面板宽度
+    buildCurrentLines();      // 按这个宽度折行
+    applyImageMarkers(revealAt);  // 应用已经浮现到的图片指令（可能改宽度）
+    const int w1 = (int)(g_rcPanel.right - g_rcPanel.left);
+    computeLayout();
+    if ((int)(g_rcPanel.right - g_rcPanel.left) != w1) {
+        buildCurrentLines();
+        computeLayout();
     }
 }
 
@@ -3602,9 +3774,10 @@ static void drawHeader(HDC dc) {
     t1.right -= S(8);
     SelectObject(dc, g_fTitle);
     SetTextColor(dc, Theme::TEXT);
-    const wstring title =
-        (g_screen != Screen::Archives && !g_ar.title.empty()) ? g_ar.title
-                                                              : wstring(L"愚 见 者 的 故 事 书");
+    // 只有故事页和流程图才显示"当前剧本"的名字；档案列表 / 设置 / 引导页都显示软件名
+    const bool storyish = (g_screen == Screen::Story || g_screen == Screen::Flowchart);
+    const wstring title = (storyish && !g_ar.title.empty()) ? g_ar.title
+                                                            : wstring(L"愚 见 者 的 故 事 书");
     DrawTextW(dc, title.c_str(), -1, &t1, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     RECT t2 = g_rcHeader;
@@ -3624,6 +3797,10 @@ static void drawHeader(HDC dc) {
             if (nodeVisited(n.name)) ++visited;
         sub = L"流程图 ｜ 已解锁节点 " + std::to_wstring(visited) + L" / " +
               std::to_wstring(g_ar.nodes.size()) + L"　｜　点已经走过的节点可以回溯";
+    } else if (g_screen == Screen::About) {
+        sub = L"剧本添加引导 ｜ 复制全文发给任意 AI，就能照着帮你写新剧本、配图片素材";
+    } else if (g_screen == Screen::Settings) {
+        sub = L"设置 ｜ 窗口大小、打字速度都在这里";
     } else {
         sub = L"选择故事档案（共 " + std::to_wstring(g_archives.size()) +
               L" 个） ｜ 剧本放在 stories 文件夹";
@@ -3959,10 +4136,8 @@ static void drawStatsPanel(HDC dc) {
             if (a) {
                 if (a->items.empty())
                     txt += L"（空）";
-                for (size_t i = 0; i < a->items.size(); ++i) {
-                    if (i) txt += L"、";
-                    txt += expandVars(a->items[i].text);
-                }
+                else
+                    txt += joinArrayForDisplay(a);
             } else {
                 txt += L"（没有这个数组）";
             }
@@ -4281,7 +4456,11 @@ static void drawInfoWindow(HDC dc) {
 
     const int lineH = S(26);
     const int viewH = lineBottom - lineTop - S(10);
-    const int maxScroll = (std::max)(0, (int)g_infoLines.size() * lineH - viewH);
+    const int gapH = S(14);   // 段间空行的高度（含分隔线）
+    int contentH = 0;
+    for (size_t i = 0; i < g_infoLines.size(); ++i)
+        contentH += ((i < g_infoTag.size() && g_infoTag[i] < 0) ? gapH : lineH);
+    const int maxScroll = (std::max)(0, contentH - viewH);
     g_infoScroll = (std::max)(0, (std::min)(g_infoScroll, maxScroll));
 
     const int saved = SaveDC(dc);
@@ -4289,8 +4468,18 @@ static void drawInfoWindow(HDC dc) {
     SelectObject(dc, g_fBody);
     SetTextColor(dc, Theme::TEXT);
     int y = lineTop + S(6) - g_infoScroll;
-    for (const wstring& l : g_infoLines) {
-        TextOutW(dc, r.left + S(24), y, l.c_str(), (int)l.size());
+    for (size_t i = 0; i < g_infoLines.size(); ++i) {
+        const int tag = (i < g_infoTag.size()) ? g_infoTag[i] : 0;
+        if (tag < 0) {  // 段间：留白 + 一条细线，把不同的人和事分开
+            HPEN old = (HPEN)SelectObject(dc, g_penRule);
+            MoveToEx(dc, r.left + S(24), y + gapH / 2, nullptr);
+            LineTo(dc, r.right - S(24), y + gapH / 2);
+            SelectObject(dc, old);
+            y += gapH;
+            continue;
+        }
+        const int ind = (tag == 1) ? S(18) : 0;  // 续行缩进，一眼看出属于上一条
+        TextOutW(dc, r.left + S(24) + ind, y, g_infoLines[i].c_str(), (int)g_infoLines[i].size());
         y += lineH;
     }
     RestoreDC(dc, saved);
@@ -4347,6 +4536,21 @@ static void paintFlowchart(HDC dc) {
             spread = S(6) + (int)(S(13) * t);  // 鼠标停上去：叠在一起的微微散开
         }
         drawFlowCard(dc, g_flowCards[i], hot, spread);
+    }
+    if (g_flowJumpAt > 0) {  // 刚打开流程图：当前节点套一圈"呼吸"光环，一眼看到自己在哪
+        const ULONGLONG el = GetTickCount64() - g_flowJumpAt;
+        if (el < 1400) {
+            for (const FlowCard& c : g_flowCards) {
+                if (c.ghost || c.node != g_node) continue;
+                const int phase = (int)(el % 700);
+                const int grow = S(5) + S(12) * phase / 700;
+                RECT ring = c.rc;
+                InflateRect(&ring, grow, grow);
+                const int alpha = (std::max)(25, 140 * (700 - phase) / 700);
+                blendFillRounded(dc, ring, S(20), Theme::ACCENT, (BYTE)alpha);
+                break;
+            }
+        }
     }
     RestoreDC(dc, saved);
 
@@ -4482,6 +4686,27 @@ static void paintArchives(HDC dc) {
                             progressFor(g_archives[i].base) != nullptr);
     }
     RestoreDC(dc, saved);
+
+    // 标题 + 一行小字
+    RECT t{g_rcPanel.left + S(30), g_rcPanel.top + S(12), g_rcPanel.right - S(30),
+           g_rcPanel.top + S(50)};
+    SelectObject(dc, g_fTitle);
+    SetTextColor(dc, Theme::ACCENT);
+    DrawTextW(dc, L"剧本档案", -1, &t, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT s{g_rcPanel.left + S(30), t.bottom, g_rcPanel.right - S(30), t.bottom + S(28)};
+    SelectObject(dc, g_fSmall);
+    SetTextColor(dc, Theme::HINT);
+    DrawTextW(dc, L"本游戏实为分支叙事视觉小说播放器，可根据指引自由添加删除剧本", -1, &s,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    // 右下角：圆形「档案＋」按钮 + 上面的小字说明
+    const bool bhot = (g_hotKind == HotKind::AddStory) || (g_downKind == 11);
+    RECT cap = g_addBtnCap;
+    SelectObject(dc, g_fSmall);
+    SetTextColor(dc, bhot ? Theme::ACCENT : Theme::HINT);
+    DrawTextW(dc, L"添加剧本 · 查看指引", -1, &cap, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    drawFolderPlusIcon(dc, g_addBtn, g_hotKind == HotKind::AddStory, g_downKind == 11);
+
     drawFooter(dc);
 }
 
@@ -4688,6 +4913,154 @@ static void openFolderInExplorer(const wstring& path) {
     ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+/* ---------- 档案页右下角那个圆形「档案＋」按钮 ---------- */
+
+static void layoutAddButton() {
+    const int d = S(78);          // 圆的直径
+    const int cx = (int)g_rcPanel.right - S(78);
+    const int cy = (int)g_rcPanel.bottom - S(78);
+    g_addBtn = {cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2};
+    const int capW = S(260);
+    g_addBtnCap = {cx - capW / 2, g_addBtn.top - S(30), cx + capW / 2, g_addBtn.top - S(6)};
+}
+
+static bool inAddButton(POINT p) {  // 圆的命中判定
+    const int cx = (g_addBtn.left + g_addBtn.right) / 2;
+    const int cy = (g_addBtn.top + g_addBtn.bottom) / 2;
+    const int r = (g_addBtn.right - g_addBtn.left) / 2 + S(4);
+    const int dx = p.x - cx, dy = p.y - cy;
+    return dx * dx + dy * dy <= r * r;
+}
+
+// 圆形按钮：蓝底 +「文件夹 + 加号」图标，悬停变亮、按下变深并下沉一点
+static void drawFolderPlusIcon(HDC dc, const RECT& rc, bool hot, bool down) {
+    const int cx = (rc.left + rc.right) / 2;
+    const int cy = (rc.top + rc.bottom) / 2;
+    const int r = (rc.right - rc.left) / 2;
+    const COLORREF base = down ? RGB(38, 96, 190) : (hot ? RGB(74, 146, 246) : RGB(56, 122, 224));
+    HBRUSH br = CreateSolidBrush(base);
+    HPEN noPen = (HPEN)GetStockObject(NULL_PEN);
+    HGDIOBJ oldB = SelectObject(dc, br);
+    HGDIOBJ oldP = SelectObject(dc, noPen);
+    const int oy = down ? S(2) : 0;
+    Ellipse(dc, rc.left, rc.top + oy, rc.right, rc.bottom + oy);
+    SelectObject(dc, oldB);
+    SelectObject(dc, oldP);
+    DeleteObject(br);
+
+    const COLORREF ink = RGB(255, 255, 255);
+    HPEN pen = CreatePen(PS_SOLID, (std::max)(1, S(3)), ink);
+    HPEN oldPen = (HPEN)SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    const int w = (int)(r * 0.86), h = (int)(r * 0.66);
+    const int left = cx - w / 2 - (int)(r * 0.06);
+    const int top = cy - h / 2 + oy - (int)(r * 0.04);
+    // 文件夹：主体 + 上面那个小耳朵
+    RoundRect(dc, left, top + h / 4, left + w, top + h, S(6), S(6));
+    MoveToEx(dc, left + S(4), top + h / 4, nullptr);
+    LineTo(dc, left + S(4), top + h / 10);
+    LineTo(dc, left + w / 3, top + h / 10);
+    LineTo(dc, left + w / 3 + S(6), top + h / 4);
+    // 右下角的加号圆
+    const int pr = (int)(r * 0.42);
+    const int px = left + w - (int)(pr * 0.4), py = top + h - (int)(pr * 0.35);
+    HBRUSH pb = CreateSolidBrush(ink);
+    HGDIOBJ oldBrush2 = SelectObject(dc, pb);
+    HPEN oldPen2 = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+    Ellipse(dc, px - pr, py - pr, px + pr, py + pr);
+    HPEN plusPen = CreatePen(PS_SOLID, (std::max)(1, S(3)), base);
+    SelectObject(dc, plusPen);
+    MoveToEx(dc, px - pr * 2 / 3, py, nullptr);
+    LineTo(dc, px + pr * 2 / 3, py);
+    MoveToEx(dc, px, py - pr * 2 / 3, nullptr);
+    LineTo(dc, px, py + pr * 2 / 3);
+    // 先把自建的画笔/画刷换下来，再删除 —— 不能删还选在 DC 里的对象
+    SelectObject(dc, oldPen2);
+    SelectObject(dc, oldBrush2);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(plusPen);
+    DeleteObject(pb);
+    DeleteObject(pen);
+}
+
+static void startSplash() {
+    if (g_splashTried) return;
+    g_splashTried = true;
+    g_splashImg = loadImage(joinPath(g_imagesDir, L"title.png"));
+    if (!g_splashImg) return;  // 没放 title.png 就直接进档案列表
+    g_splashOn = true;
+    g_splashStart = GetTickCount64();
+    if (g_hwnd) SetTimer(g_hwnd, kTimerSplash, 16, nullptr);  // 约 60 帧，渐变才够顺
+}
+
+static void finishSplash() {
+    g_splashOn = false;
+    if (g_hwnd) KillTimer(g_hwnd, kTimerSplash);
+    freeSplashCache();
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// 开场画面：只认空格，而且第一秒内什么键都不认（免得刚开就被跳过）
+static const int kSplashNoSkipMs = 1000;
+static bool splashCanSkip() {
+    return g_splashOn && GetTickCount64() - g_splashStart >= (ULONGLONG)kSplashNoSkipMs;
+}
+
+static void paintSplash(HDC dc) {
+    const ULONGLONG el = GetTickCount64() - g_splashStart;
+
+    // 平滑缓动：0 → 1 用 smoothstep，过渡是连续的，不会一格一格跳
+    auto ease = [](double t) {
+        if (t <= 0) return 0.0;
+        if (t >= 1) return 1.0;
+        return t * t * (3.0 - 2.0 * t);
+    };
+
+    // 先备好"已经缩放到窗口大小"的开场图，之后每帧只混一次
+    buildSplashCache((int)g_cw, (int)g_ch);
+    auto blendSplash = [&](int alpha) {
+        if (!g_splashDC || alpha <= 0) return;
+        if (alpha >= 250) {  // 完全不透明：直接拷过去，既快又能排除混合那一步
+            BitBlt(dc, 0, 0, (int)g_cw, (int)g_ch, g_splashDC, 0, 0, SRCCOPY);
+            return;
+        }
+        BLENDFUNCTION bf{};
+        bf.BlendOp = AC_SRC_OVER;
+        bf.SourceConstantAlpha = (BYTE)(std::max)(0, (std::min)(255, alpha));
+        bf.AlphaFormat = 0;
+        AlphaBlend(dc, 0, 0, (int)g_cw, (int)g_ch, g_splashDC, 0, 0, (int)g_cw, (int)g_ch, bf);
+    };
+
+    if (el < (ULONGLONG)kSplashIn) {
+        // 渐显：纯黑底上把画面一点点显示出来
+        const RECT all{0, 0, g_cw, g_ch};
+        HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(dc, &all, black);
+        DeleteObject(black);
+        const double t = ease((double)el / kSplashIn);
+        blendSplash((int)(t * 255));
+    } else if (el < (ULONGLONG)kSplashHold) {
+        blendSplash(255);
+    } else {
+        if (el >= (ULONGLONG)kSplashTotal) {
+            finishSplash();
+            return;
+        }
+        // 渐隐：先把剧本列表正常画出来，再把开场图叠在上面逐渐透明 —— 于是"化"出列表
+        paintScreen(dc);
+        const double t = ease((double)(el - kSplashHold) / (kSplashTotal - kSplashHold));
+        blendSplash((int)((1.0 - t) * 255));
+    }
+
+    if (splashCanSkip()) {  // 一秒后才提示、才允许跳过
+        RECT hint{0, g_ch - S(70), g_cw, g_ch - S(34)};
+        SelectObject(dc, g_fSmall);
+        SetTextColor(dc, (el < (ULONGLONG)kSplashHold) ? RGB(170, 178, 192) : RGB(120, 130, 148));
+        DrawTextW(dc, L"空格跳过", -1, &hint, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
 static void loadAboutDoc() {
     wstring text;
     if (!readTextFile(joinPath(g_root, L"README.md"), text) || trim(text).empty()) {
@@ -4751,7 +5124,7 @@ static void paintAbout(HDC dc) {
     RECT hint{g_rcPanel.left + S(28), title.bottom, g_rcPanel.right - S(28), title.bottom + S(24)};
     SelectObject(dc, g_fSmall);
     SetTextColor(dc, Theme::HINT);
-    DrawTextW(dc, L"把下面这份说明整段复制给 AI（Codex / ChatGPT 都行），就能让它照着帮你写新剧本、配图片素材。",
+    DrawTextW(dc, L"把下面这份说明整段复制给任意 AI（本地的、在线的都行），它就能照着帮你写新剧本、配图片素材。",
               -1, &hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     auto drawBtn = [&](const RECT& r, const wstring& label, bool hot) {
@@ -4963,6 +5336,14 @@ static void paintSettings(HDC dc) {
 
 static void paintAll(HDC dc) {
     SetBkMode(dc, TRANSPARENT);
+    if (g_splashOn) {  // 开场：title.png 渐显渐隐
+        paintSplash(dc);
+        return;
+    }
+    paintScreen(dc);
+}
+
+static void paintScreen(HDC dc) {
     if (g_screen == Screen::Story)
         paintStory(dc);
     else if (g_screen == Screen::Flowchart)
@@ -4997,15 +5378,28 @@ static void openInfoBlock(const InfoBlock& ib) {
     g_infoCurrent = ib;
     g_infoScroll = 0;
     g_infoLines.clear();
+    g_infoTag.clear();  // -1 = 段间空行（画一条分隔线），0 = 段首，1 = 段内续行
     const RECT r = infoRect();
     const int maxW = (int)(r.right - r.left) - S(48);
+    bool first = true;
     for (const Step& st : g_infoCurrent.body.steps) {
         if (st.kind == Step::Image) continue;
+        if (!first) {  // 段落之间空一行 + 一条细线，人和人之间就分得开了
+            g_infoLines.push_back(wstring());
+            g_infoTag.push_back(-1);
+        }
+        first = false;
         vector<wstring> ls;
-        wrapInto(expandVars(st.text), g_fBody, maxW, ls);
-        for (const wstring& l : ls) g_infoLines.push_back(l);
+        wrapInto(expandVars(st.text), g_fBody, maxW - S(18), ls);
+        for (size_t i = 0; i < ls.size(); ++i) {
+            g_infoLines.push_back(ls[i]);
+            g_infoTag.push_back(i == 0 ? 0 : 1);
+        }
     }
-    if (g_infoLines.empty()) g_infoLines.push_back(L"（这里还没有内容）");
+    if (g_infoLines.empty()) {
+        g_infoLines.push_back(L"（这里还没有内容）");
+        g_infoTag.push_back(0);
+    }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -5032,9 +5426,7 @@ static void enterFeedback(const wstring& title, const vector<Step>& steps, int n
     g_typing = false;
     buildUiButtons();   // 这时候只有一个「确认」
     computeLayout();
-    buildCurrentLines();
-    applyImageMarkers(0);
-    computeLayout();
+    layoutStoryText(0);
     g_textScroll = 0;
     g_autoScroll = true;
     g_typing = true;
@@ -5087,9 +5479,7 @@ static void resumeNodeAfterCards() {
     g_shownSteps = n.steps;
     buildUiButtons();
     computeLayout();
-    buildCurrentLines();
-    applyImageMarkers(0);
-    computeLayout();
+    layoutStoryText(0);
     g_textScroll = 0;
     g_autoScroll = true;
     g_typing = true;
@@ -5252,9 +5642,7 @@ static void runActionBlock(int index) {
 
     buildUiButtons();
     computeLayout();
-    buildCurrentLines();
-    applyImageMarkers(0);
-    computeLayout();
+    layoutStoryText(0);
     g_textScroll = 0;
     g_autoScroll = true;
     g_typing = true;
@@ -5297,7 +5685,9 @@ static void startNode(int idx, bool recordEdge, bool applyEnter) {
     g_lastStory = g_ar.base;
 
     g_typing = false;
-    g_shownSteps = n.steps;  // 面板先显示节点正文
+    // 面板先显示节点正文；正文是空的（比如纯 @行动 的封装节点）就保留上一页文字，
+    // 免得玩家进来看见一个空白的文字框
+    if (!n.steps.empty()) g_shownSteps = n.steps;
 
     // 画面卡：先依次放卡片，放完再回到这个节点的正文
     if (!n.cards.empty()) {
@@ -5310,10 +5700,7 @@ static void startNode(int idx, bool recordEdge, bool applyEnter) {
     if (!n.actions.empty() && tryLeaveVia(n.jumps)) return;
 
     buildUiButtons();
-    computeLayout();            // 先拿到面板宽度
-    buildCurrentLines();        // 按宽度折行
-    applyImageMarkers(0);       // 应用节点开头就生效的图片指令
-    computeLayout();            // 小窗 / 全屏可能变了，再排一次
+    layoutStoryText(0);  // 折行 + 应用图片指令；图片改了正文框宽度会自动重折一遍
 
     g_textScroll = 0;           // 新节点从顶部开始
     g_infoOpen = false;         // 换节点时关掉信息窗
@@ -5697,7 +6084,14 @@ static void activateButton(int i) {
         const Node& n = g_ar.nodes[g_node];
         if (b.arg < (int)n.choices.size()) {
             const Choice& c = n.choices[b.arg];
-            if (!evalConds(c.conds)) return;  // 数值已经变了，这条选不了
+            if (!evalConds(c.conds)) {  // 数值已经变了，这条选不了
+                // 以前是"静默什么都不做"，玩家会觉得按钮坏了；现在给出原因并刷新按钮
+                g_status = L"这条选项现在走不通了（条件不满足），按钮已经收起来";
+                buildUiButtons();
+                computeLayout();
+                InvalidateRect(g_hwnd, nullptr, FALSE);
+                return;
+            }
             applyEffects(c.effects);          // 先结算选项的数值变化
             const int t = nodeIndexOf(g_ar, c.target);
             const int target = (t >= 0) ? t : g_ar.startIndex;
@@ -5710,11 +6104,19 @@ static void activateButton(int i) {
             startNode(target, true, true);
         }
     } else if (b.kind == 1) {
+        bool moved = false;
         for (const JumpTarget& j : g_ar.nodes[g_node].jumps) {
             if (!evalConds(j.conds)) continue;
             const int t = nodeIndexOf(g_ar, j.target);
+            moved = true;
             startNode(t >= 0 ? t : g_ar.startIndex, true, true);
             break;
+        }
+        if (!moved) {  // 同上：出口的条件现在不满足，别让「继续」变成死按钮
+            g_status = L"这一条出口现在走不通（条件不满足），按钮已经换掉";
+            buildUiButtons();
+            computeLayout();
+            InvalidateRect(g_hwnd, nullptr, FALSE);
         }
     } else if (b.kind == 2) {
         restartArchive();
@@ -5739,6 +6141,32 @@ static void runAction(Action a) {
                 g_flowScrollX = 0;
                 g_flowScrollY = 0;
                 relayout();
+                // 打开流程图时直接滚到"我现在在哪个节点"，不用从左上角找起
+                const wstring cur = (g_node >= 0 && g_node < (int)g_ar.nodes.size())
+                                        ? g_ar.nodes[g_node].name
+                                        : wstring();
+                int wantIdx = -1;
+                for (size_t i = 0; i < g_flowPlan.size(); ++i) {
+                    const FlowCard& c = g_flowPlan[i];
+                    if (c.ghost) continue;
+                    if (c.node == g_node) { wantIdx = (int)i; break; }
+                }
+                if (wantIdx < 0 && !cur.empty())  // 兜底：按存档里"停在哪"找
+                    for (size_t i = 0; i < g_flowPlan.size(); ++i)
+                        if (!g_flowPlan[i].ghost && g_flowPlan[i].node >= 0 &&
+                            g_ar.nodes[g_flowPlan[i].node].name == cur) { wantIdx = (int)i; break; }
+                if (wantIdx >= 0) {
+                    const RECT& r = g_flowPlan[wantIdx].rc;
+                    const int cw2 = (int)(r.right - r.left);
+                    const int ch2 = (int)(r.bottom - r.top);
+                    const int wantX = (int)r.left - (flowViewportW() - cw2) / 2;  // 横向居中
+                    const int wantY = (int)r.top - (flowViewportH() - ch2) / 2;   // 纵向居中
+                    g_flowScrollX = (std::max)(0, (std::min)(wantX, flowMaxScrollX()));
+                    g_flowScrollY = (std::max)(0, (std::min)(wantY, flowMaxScrollY()));
+                    computeLayout();
+                }
+                g_flowJumpAt = GetTickCount64();  // 打开时让当前节点闪一下，一眼看到自己在哪
+                SetTimer(g_hwnd, kTimerUi, 100, nullptr);
                 InvalidateRect(g_hwnd, nullptr, FALSE);
             }
             break;
@@ -5763,6 +6191,8 @@ static void runAction(Action a) {
             if (g_screen != Screen::Settings) g_settingsFrom = g_screen;
             g_screen = Screen::Settings;
             g_ddOpen = false;
+            g_btnRect.clear();
+            if (g_hwnd) KillTimer(g_hwnd, kTimerMarquee);  // 离开故事页就把轮播计时器停掉
             relayout();
             InvalidateRect(g_hwnd, nullptr, FALSE);
             break;
@@ -5774,7 +6204,7 @@ static void runAction(Action a) {
             break;
         case A_CopyDoc:
             copyTextToClipboard(g_docPayload);
-            g_status = L"整份说明已复制到剪贴板：粘给 AI（Codex / ChatGPT）就能让它照着帮你写剧本、配图";
+            g_status = L"整份说明已复制到剪贴板：粘给任意 AI，它就能照着帮你写剧本、配图";
             InvalidateRect(g_hwnd, nullptr, FALSE);
             break;
         case A_OpenStories:
@@ -5854,6 +6284,11 @@ static void updateHover(POINT p) {
                 return;
             }
     } else if (g_screen == Screen::Archives && PtInRect(&g_rcPanel, p)) {
+        if (inAddButton(p)) {  // 右下角那个圆形按钮
+            g_hotKind = HotKind::AddStory;
+            g_hotIndex = 0;
+            return;
+        }
         for (size_t i = 0; i < g_archiveCards.size() && i < g_archives.size(); ++i) {
             const RECT dr = delSaveRect(g_archiveCards[i]);
             if (progressFor(g_archives[i].base) && PtInRect(&dr, p)) {
@@ -5971,6 +6406,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             bootstrapApp();
             scanArchives();
             computeLayout();
+            startSplash();  // 有 images\title.png 就先放一段开场
             return 0;
         }
 
@@ -5988,14 +6424,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
             if (g_cw > 0 && g_ch > 0) {
-                HDC mem = CreateCompatibleDC(dc);
-                HBITMAP bmp = CreateCompatibleBitmap(dc, g_cw, g_ch);
-                HGDIOBJ old = SelectObject(mem, bmp);
-                paintAll(mem);
-                BitBlt(dc, 0, 0, g_cw, g_ch, mem, 0, 0, SRCCOPY);
-                SelectObject(mem, old);
-                DeleteObject(bmp);
-                DeleteDC(mem);
+                // 复用同一张离屏位图：每帧新建 2560×1600 的位图要十几毫秒，动画会一顿一顿的
+                if (!g_paintDC || g_paintW != (int)g_cw || g_paintH != (int)g_ch) {
+                    if (g_paintDC) {
+                        DeleteDC(g_paintDC);
+                        g_paintDC = nullptr;
+                    }
+                    if (g_paintBmp) {
+                        DeleteObject(g_paintBmp);
+                        g_paintBmp = nullptr;
+                    }
+                    g_paintDC = CreateCompatibleDC(dc);
+                    g_paintBmp = CreateCompatibleBitmap(dc, g_cw, g_ch);
+                    if (g_paintDC && g_paintBmp) {
+                        SelectObject(g_paintDC, g_paintBmp);
+                        g_paintW = (int)g_cw;
+                        g_paintH = (int)g_ch;
+                    }
+                }
+                if (g_paintDC && g_paintBmp) {
+                    // 复用位图，所以每帧先擦一遍底，免得上一屏没被覆盖到的地方留下重影
+                    RECT all{0, 0, (LONG)g_cw, (LONG)g_ch};
+                    HBRUSH bg = CreateSolidBrush(Theme::BG_TOP);
+                    FillRect(g_paintDC, &all, bg);
+                    DeleteObject(bg);
+                    paintAll(g_paintDC);
+                    BitBlt(dc, 0, 0, g_cw, g_ch, g_paintDC, 0, 0, SRCCOPY);
+                }
             }
             EndPaint(hwnd, &ps);
             return 0;
@@ -6036,7 +6491,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         ++it;
                     }
                 }
-                if (!active) KillTimer(hwnd, kTimerUi);
+                const bool glow = (g_flowJumpAt > 0 && now - g_flowJumpAt < 1400);
+                if (!glow) g_flowJumpAt = 0;
+                if (!active && !glow) KillTimer(hwnd, kTimerUi);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             if (wp == kTimerFlowAnim) {  // 叠卡展开 / 收起
@@ -6066,6 +6523,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_marqueeMs > 100000000) g_marqueeMs = 0;
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
+            }
+            if (wp == kTimerSplash) {
+                if (!g_splashOn || GetTickCount64() - g_splashStart >= (ULONGLONG)kSplashTotal)
+                    finishSplash();
+                else
+                    InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
 
@@ -6130,6 +6593,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_LBUTTONDOWN: {
             const POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (clickLocked()) return 0;  // 点击冷却中：这一下直接吞掉
+            if (g_splashOn) return 0;  // 开场画面：鼠标点什么都不管（只有空格能跳过）
             if (g_cardAt >= 0) {  // 画面卡：点一下继续
                 cardInput();
                 return 0;
@@ -6206,6 +6671,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (g_hotKind == HotKind::AboutBtn) {
                 g_downKind = 10;
                 g_downIndex = g_hotIndex;
+            } else if (g_hotKind == HotKind::AddStory) {
+                g_downKind = 11;
+                g_downIndex = 0;
             } else if (g_hotKind == HotKind::Archive) {
                 g_downKind = 1;
                 g_downIndex = g_hotIndex;
@@ -6226,6 +6694,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_LBUTTONUP: {
+            if (clickLocked()) return 0;  // 点击冷却中
+            // 这次点击（不管有没有命中控件）都算一次，处理完就开始冷却
+            g_clickLockUntil = GetTickCount64() + kClickCooldownMs;
             if (g_dragThumb) {
                 g_dragThumb = false;
                 ReleaseCapture();
@@ -6284,6 +6755,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (kind == 11 && g_hotKind == HotKind::AddStory) {  // 档案页右下角的「档案＋」
+                runAction(A_About);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (kind == 0 && g_hotKind == HotKind::Choice && g_hotIndex == index) {
                 activateButton(index);
             } else if (kind == 1 && g_hotKind == HotKind::Archive && g_hotIndex == index) {
@@ -6308,6 +6784,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_MOUSEWHEEL: {
             const int delta = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+            if (clickLocked()) return 0;  // 点击冷却中：滚轮也不响应
+            if (g_splashOn) return 0;  // 开场画面：滚轮也不响应
             if (g_fanOpen) return 0;  // 展开面板开着时不滚流程图
             if (g_screen == Screen::About) {  // 引导页里滚 README
                 g_docScroll = (std::max)(0, (std::min)(g_docScroll - delta * S(30) * 3,
@@ -6341,6 +6819,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_KEYDOWN: {
+            if (g_splashOn) {  // 开场画面：只认空格，而且第一秒内不认任何键
+                if (wp == VK_SPACE && splashCanSkip()) finishSplash();
+                return 0;  // 其它键一律吃掉，不会漏到后面的界面
+            }
             if (g_fanOpen) {  // 展开面板：Esc 退回流程图，其它键都不响应
                 if (wp == VK_ESCAPE) closeFlowFan();
                 return 0;
@@ -6509,11 +6991,59 @@ static void decideClientSize(int& cw, int& ch) {
     }
 }
 
+/* ---------- 崩溃记录：出错时在 exe 旁边留一份文件 ----------
+   有 崩溃.txt = 程序崩了；没有它却"卡住" = 是真的卡住。
+   这两种情况要查的方向完全不同，所以这份记录很有用。 */
+static wstring screenNameFor(Screen s) {
+    switch (s) {
+        case Screen::Archives: return L"剧本档案";
+        case Screen::Story: return L"故事";
+        case Screen::Flowchart: return L"流程图";
+        case Screen::Settings: return L"设置";
+        case Screen::About: return L"剧本添加引导";
+    }
+    return L"未知";
+}
+
+static LONG WINAPI crashHandler(EXCEPTION_POINTERS* ep) {
+    wstring text = L"愚见者的故事书 · 崩溃记录\r\n";
+    text += L"（程序出错时自动生成，把它发给开发者就能定位）\r\n\r\n";
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t buf[256];
+    wsprintfW(buf, L"时间：%04d-%02d-%02d %02d:%02d:%02d\r\n", (int)st.wYear, (int)st.wMonth,
+              (int)st.wDay, (int)st.wHour, (int)st.wMinute, (int)st.wSecond);
+    text += buf;
+    if (ep && ep->ExceptionRecord) {
+        wsprintfW(buf, L"异常代码：0x%08X\r\n", (unsigned)ep->ExceptionRecord->ExceptionCode);
+        text += buf;
+        wsprintfW(buf, L"出错地址：0x%p\r\n", (void*)ep->ExceptionRecord->ExceptionAddress);
+        text += buf;
+    }
+    text += L"界面：" + screenNameFor(g_screen) + L"\r\n";
+    text += L"剧本：" + (g_ar.base.empty() ? wstring(L"（没打开）") : g_ar.base);
+    if (g_node >= 0 && g_node < (int)g_ar.nodes.size()) text += L"　节点：" + g_ar.nodes[g_node].name;
+    text += L"\r\n";
+    wsprintfW(buf, L"窗口：%d × %d　界面缩放：%d　显示缩放：%d\r\n", (int)g_cw, (int)g_ch, g_dpi,
+              g_dispDpi);
+    text += buf;
+    POINT cp{};
+    GetCursorPos(&cp);
+    wsprintfW(buf, L"鼠标：%d,%d　信息窗:%d　流程图展开:%d　设置下拉:%d　开场:%d　全屏图:%d\r\n",
+              (int)cp.x, (int)cp.y, g_infoOpen ? 1 : 0, g_fanOpen ? 1 : 0, g_ddOpen ? 1 : 0,
+              g_splashOn ? 1 : 0, g_imgFull ? 1 : 0);
+    text += buf;
+    text += L"版本：" + g_version + L"\r\n";
+    writeTextFile(joinPath(g_root, L"崩溃.txt"), text, true);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
         typedef BOOL(WINAPI * SetDpiAwareFn)(void);
         if (auto fn = (SetDpiAwareFn)GetProcAddress(user32, "SetProcessDPIAware")) fn();
     }
+    SetUnhandledExceptionFilter(crashHandler);  // 崩了就在 exe 旁边留一份 崩溃.txt
 
     Gdiplus::GdiplusStartupInput gdiInput;
     if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiInput, nullptr) != Gdiplus::Ok) return 1;

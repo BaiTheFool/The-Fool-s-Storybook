@@ -119,6 +119,10 @@ if (Test-Path -LiteralPath $storiesDir) {
 
 if (-not $NoImages -and (Test-Path -LiteralPath $imagesDir)) {
     $imageExt = @(".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+    # images\ 根目录下的图也要带上（比如开场用的 title.png）
+    Get-ChildItem -LiteralPath $imagesDir -File |
+        Where-Object { $imageExt -contains $_.Extension.ToLower() } |
+        ForEach-Object { Add-File ("images\" + $_.Name) $_.FullName }
     Get-ChildItem -LiteralPath $imagesDir -Directory | ForEach-Object {
         $story = $_
         Get-ChildItem -LiteralPath $story.FullName -File |
